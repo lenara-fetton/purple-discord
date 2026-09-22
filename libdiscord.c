@@ -188,7 +188,11 @@ typedef enum {
 	CHANNEL_GUILD_STAGE_VOICE = 13,
 	CHANNEL_GUILD_DIRECTORY = 14,
 	CHANNEL_GUILD_FORUM = 15,
+	CHANNEL_GUILD_MEDIA = 16,
 } DiscordChannelType;
+
+/* Only 10-12 are threads; forum/media channels contain threads but aren't threads themselves */
+#define DISCORD_CHANNEL_IS_THREAD(type) ((type) == CHANNEL_GUILD_NEWS_THREAD || (type) == CHANNEL_GUILD_PUBLIC_THREAD || (type) == CHANNEL_GUILD_PRIVATE_THREAD)
 
 typedef enum {
 	MESSAGE_DEFAULT = 0,
@@ -616,7 +620,7 @@ discord_new_channel(JsonObject *json)
 	channel->last_message_id = to_int(json_object_get_string_member(json, "last_message_id"));
 	channel->parent_id = to_int(json_object_get_string_member(json, "parent_id"));
 	channel->name = g_strdup(json_object_get_string_member(json, "name"));
-	if (channel->type < CHANNEL_GUILD_NEWS_THREAD || channel->type == CHANNEL_GUILD_STAGE_VOICE) {
+	if (!DISCORD_CHANNEL_IS_THREAD(channel->type)) {
 		channel->topic = g_strdup(json_object_get_string_member(json, "topic"));
 		channel->position = json_object_get_int_member(json, "position");
 		channel->threads = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, NULL);
@@ -1458,6 +1462,25 @@ discord_proxy_connection_free(DiscordProxyConnection *conn)
 	g_free(conn);
 }
 
+/* Quote a filename for a multipart Content-Disposition the way browsers do:
+ * only characters that would break the header are percent-encoded */
+static gchar *
+discord_escape_form_filename(const gchar *filename)
+{
+	GString *ret = g_string_new(NULL);
+
+	for (const gchar *c = filename; c && *c; c++) {
+		switch (*c) {
+			case '"': g_string_append(ret, "%22"); break;
+			case '\r': g_string_append(ret, "%0D"); break;
+			case '\n': g_string_append(ret, "%0A"); break;
+			default: g_string_append_c(ret, *c); break;
+		}
+	}
+
+	return g_string_free(ret, FALSE);
+}
+
 /* Requests whose bodies or responses carry passwords, MFA codes or tokens */
 static gboolean
 discord_url_is_sensitive(const gchar *url)
@@ -1494,9 +1517,11 @@ discord_get_display_name(DiscordAccount *da, DiscordGuild *guild, DiscordChannel
 	} else if (channel == NULL) {
 		// Probably a DM
 		tmp = discord_create_fullname(user);
-		PurpleBuddy *buddy = purple_blist_find_buddy(da->account, ret);
-		if (buddy != NULL)
+		PurpleBuddy *buddy = tmp ? purple_blist_find_buddy(da->account, tmp) : NULL;
+		if (buddy != NULL) {
+			g_free(tmp);
 			tmp = g_strdup(purple_buddy_get_alias(buddy));
+		}
 
 	} else {
 		tmp = discord_create_nickname(user, guild, channel);
@@ -1679,6 +1704,7 @@ discord_response_callback(PurpleHttpConnection *http_conn,
 		gchar *error_msg_formatted = g_strdup_printf(_("Connection error: %s."), error_message);
 		purple_connection_error(conn->ya->pc, PURPLE_CONNECTION_ERROR_NETWORK_ERROR, error_msg_formatted);
 		g_free(error_msg_formatted);
+		g_object_unref(parser);
 		discord_proxy_connection_free(conn);
 		return;
 	}
@@ -4260,7 +4286,8 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 			const gchar *new_username = json_object_get_string_member(userdata, "username");
 			const gchar *new_discriminator = json_object_get_string_member(userdata, "discriminator");
 			gint64 new_disc = to_int(new_discriminator);
-			if (new_username && new_disc && (!purple_strequal(user->name, new_username) || user->discriminator != new_disc)) {
+			/* Check the field is present rather than non-zero: new-system usernames have discriminator "0" */
+			if (new_username && new_discriminator && (!purple_strequal(user->name, new_username) || user->discriminator != new_disc)) {
 
 				// create a new PurpleBuddy, add to the current PurpleBuddy's PurpleContact, 'disable' the old PurpleBuddy
 				// this allows Pidgin to see the logs for a merged contact, as well as seamlessly switch between old and new
@@ -4418,9 +4445,16 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 		}
 
 		gchar *msg_times;
-		if (purple_strequal(type, "MESSAGE_DELETE_BULK")) {
-			JsonArray *ids = json_object_get_array_member(data, "ids");
-			guint num_msgs = json_array_get_length(ids);
+		JsonArray *bulk_ids = json_object_get_array_member(data, "ids");
+		guint bulk_len = bulk_ids ? json_array_get_length(bulk_ids) : 0;
+
+		if (purple_strequal(type, "MESSAGE_DELETE_BULK") && bulk_len == 0) {
+			return;
+		}
+
+		if (purple_strequal(type, "MESSAGE_DELETE_BULK") && bulk_len > 1) {
+			JsonArray *ids = bulk_ids;
+			guint num_msgs = bulk_len;
 			guint printed_msgs = 2;
 			if (num_msgs > 10) {
 				msg_times = g_strdup_printf(_("%u messages between "), num_msgs);
@@ -4445,7 +4479,8 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 			g_free(msg_times);
 			msg_times = tmp;
 		} else {
-			const gchar *id = json_object_get_string_member(data, "id");
+			/* A single delete, or a bulk delete of one message */
+			const gchar *id = bulk_len == 1 ? json_array_get_string_element(bulk_ids, 0) : json_object_get_string_member(data, "id");
 			gchar *timestring = discord_parse_timestamp(discord_time_from_snowflake(to_int(id)));
 			msg_times = g_strdup_printf(_("Message at %s was deleted"), timestring);
 			g_free(timestring);
@@ -4532,12 +4567,13 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 			}
 		} else if (channel_type == CHANNEL_GROUP_DM) {
 			discord_got_group_dm(da, data);
-		} else if (channel_type == CHANNEL_GUILD_TEXT || channel_type == CHANNEL_GUILD_NEWS || (channel_type >= CHANNEL_GUILD_NEWS_THREAD && channel_type != CHANNEL_GUILD_STAGE_VOICE)) {
+		} else if (channel_type == CHANNEL_GUILD_TEXT || channel_type == CHANNEL_GUILD_NEWS || DISCORD_CHANNEL_IS_THREAD(channel_type) ||
+				channel_type == CHANNEL_GUILD_FORUM || channel_type == CHANNEL_GUILD_MEDIA) {
 			const gchar *guild_id = json_object_get_string_member(data, "guild_id");
 			DiscordGuild *guild = discord_get_guild(da, to_int(guild_id));
 			if (guild != NULL) {
 				DiscordChannel *channel;
-				if (channel_type < CHANNEL_GUILD_NEWS_THREAD) {
+				if (!DISCORD_CHANNEL_IS_THREAD(channel_type)) {
 					channel = discord_add_channel(da, guild, data, guild->id);
 				} else {
 					const gchar *parent_id = json_object_get_string_member(data, "parent_id");
@@ -4737,7 +4773,7 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 
 		if (json_object_has_member(data, "resume_gateway_url")) {
 			const gchar *resume_gateway_url = json_object_get_string_member(data, "resume_gateway_url");
-			if (strncmp(resume_gateway_url, "wss://", 6) == 0) {
+			if (resume_gateway_url != NULL && strncmp(resume_gateway_url, "wss://", 6) == 0) {
 				g_free(da->gateway_url);
 				da->gateway_url = g_strdup(&resume_gateway_url[6]);
 			}
@@ -5016,7 +5052,8 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 			return;
 		}
 		JsonObject *request = json_object_get_object_member(data, "request");
-		guint64 user_id = json_object_get_int_member(request, "user_id");
+		/* Snowflakes are strings */
+		guint64 user_id = to_int(json_object_get_string_member(request, "user_id"));
 		if (user_id == da->self_user_id) {
 			// We only care about our own requests
 			const gchar *status = json_object_get_string_member(data, "status");
@@ -5250,7 +5287,8 @@ discord_get_room_category(DiscordAccount *da, GHashTable *id_to_category, guint6
 	purple_roomlist_room_add(roomlist, room);
 
 	/* Record it */
-	g_hash_table_replace_int64(id_to_category, parent_id, room);
+	/* Heap key: parent_id is a parameter, so &parent_id would dangle */
+	g_hash_table_replace(id_to_category, g_memdup2(&parent_id, sizeof(parent_id)), room);
 	return room;
 }
 
@@ -5275,7 +5313,7 @@ discord_roomlist_got_list(DiscordAccount *da, DiscordGuild *guild, gpointer user
 		g_hash_table_iter_init(&iter, da->group_dms);
 	}
 
-	GHashTable *id_to_category = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, NULL);
+	GHashTable *id_to_category = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
 
 	while (g_hash_table_iter_next(&iter, &key, &value)) {
 		DiscordChannel *channel = value;
@@ -6133,7 +6171,8 @@ discord_got_read_states(DiscordAccount *da, JsonNode *node, gpointer user_data)
 			gboolean isDM = g_hash_table_contains(da->one_to_ones, channel);
 
 			if (isDM && mentions) {
-				discord_get_history(da, channel, last_id_s, mentions * 2);
+				/* Discord rejects limit > 100 */
+				discord_get_history(da, channel, last_id_s, MIN(mentions * 2, 100));
 			} else if (!isDM) {
 				DiscordGuild *dguild = NULL;
 				DiscordChannel *dchannel = discord_get_channel_global_int_guild(da, to_int(channel), &dguild);
@@ -6591,6 +6630,7 @@ discord_process_qrcode_auth_frame(DiscordAccount *da, const gchar *frame)
 
 	if (!json_parser_load_from_data(parser, frame, -1, NULL)) {
 		purple_debug_error("discord", "Error parsing response: %s\n", frame);
+		g_object_unref(parser);
 		return FALSE;
 	}
 
@@ -6732,6 +6772,7 @@ discord_process_frame(DiscordAccount *da, const gchar *frame)
 
 	if (!json_parser_load_from_data(parser, frame, -1, NULL)) {
 		purple_debug_error("discord", "Error parsing response: %s\n", frame);
+		g_object_unref(parser);
 		return TRUE;
 	}
 
@@ -7529,16 +7570,17 @@ discord_send_react_cb(DiscordAccount *da, JsonNode *node, gpointer user_data)
 static void
 discord_react_cb(DiscordAccount *da, JsonNode *node, gpointer user_data)
 {
-	JsonArray *data_items = json_node_get_array(node);
-	guint len = json_array_get_length(data_items);
-	JsonObject *data = json_array_get_object_element(data_items, len-1);
 	DiscordReaction *react = user_data;
 	guint64 reactor_id = react->user_id;
 
-	if (node == NULL) {
+	if (node == NULL || !JSON_NODE_HOLDS_ARRAY(node) || json_array_get_length(json_node_get_array(node)) == 0) {
 		discord_free_reaction(react);
 		return;
 	}
+
+	JsonArray *data_items = json_node_get_array(node);
+	guint len = json_array_get_length(data_items);
+	JsonObject *data = json_array_get_object_element(data_items, len-1);
 
 	const gchar *channel_id_s = json_object_get_string_member(data, "channel_id");
 	JsonObject *author_obj = json_object_get_object_member(data, "author");
@@ -7662,7 +7704,7 @@ discord_chat_threads(PurpleConnection *pc, int id, const gchar *filter)
 			gchar *creation_time_s = g_date_time_format(creation_time, "%F %T");
 			GDateTime* last_message_time = g_date_time_new_from_unix_local(discord_time_from_snowflake(thread->last_message_id));
 			gchar *last_message_time_s;
-			if (thread->last_message_id == DISCORD_EPOCH_MS/1000)
+			if (thread->last_message_id == 0)
 				last_message_time_s = g_strdup("(null)             ");
 			else
 				last_message_time_s = g_date_time_format(last_message_time, "%F %T");
@@ -7782,7 +7824,7 @@ discord_chat_nick(PurpleConnection *pc, int id, const gchar *new_nick)
 		json_object_set_string_member(data, "nick", new_nick);
 		gchar *postdata = json_object_to_string(data);
 
-		gchar *url = g_strdup_printf("https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/guilds/%" G_GUINT64_FORMAT "/members/@me/nick", guild->id);
+		gchar *url = g_strdup_printf("https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/guilds/%" G_GUINT64_FORMAT "/members/@me", guild->id); /* .../@me/nick is deprecated */
 		discord_fetch_url_with_method(da, "PATCH", url, postdata, NULL, NULL);
 
 		g_free(url);
@@ -8150,9 +8192,10 @@ discord_set_room_last_id(DiscordAccount *da, guint64 id, guint64 last_id)
 		}
 	}
 
+	/* Store the account-wide maximum, not this room's id, so it never goes backwards */
 	da->last_message_id = MAX(da->last_message_id, last_id);
-	purple_account_set_int(da->account, "last_message_id_high", last_id >> 32);
-	purple_account_set_int(da->account, "last_message_id_low", last_id & 0xFFFFFFFF);
+	purple_account_set_int(da->account, "last_message_id_high", da->last_message_id >> 32);
+	purple_account_set_int(da->account, "last_message_id_low", da->last_message_id & 0xFFFFFFFF);
 
 	g_free(channel_id);
 }
@@ -8510,6 +8553,10 @@ discord_join_chat(PurpleConnection *pc, GHashTable *chatdata)
 static void
 discord_got_ack_token(DiscordAccount *da, JsonNode *node, gpointer user_data)
 {
+	if (node == NULL || !JSON_NODE_HOLDS_OBJECT(node)) {
+		return;
+	}
+
 	JsonObject *ack_response = json_node_get_object(node);
 	const gchar *token = json_object_get_string_member(ack_response, "token");
 
@@ -8546,7 +8593,8 @@ discord_mark_room_messages_read(DiscordAccount *da, guint64 channel_id)
 	}
 
 	if (last_message_id == 0) {
-		purple_debug_info("discord", "Won't ack message ID == 0");
+		purple_debug_info("discord", "Won't ack message ID == 0\n");
+		return;
 	}
 
 	guint64 known_message_id = discord_get_room_last_id(da, channel_id);
@@ -8563,7 +8611,14 @@ discord_mark_room_messages_read(DiscordAccount *da, guint64 channel_id)
 	gchar *url;
 
 	url = g_strdup_printf("https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/channels/%" G_GUINT64_FORMAT "/messages/%" G_GUINT64_FORMAT "/ack", channel_id, last_message_id);
-	gchar *postdata = g_strconcat("{\"token\":\"", da->ack_token ? da->ack_token : "null", "\"}", NULL);
+	JsonObject *ack = json_object_new();
+	if (da->ack_token) {
+		json_object_set_string_member(ack, "token", da->ack_token);
+	} else {
+		json_object_set_null_member(ack, "token");
+	}
+	gchar *postdata = json_object_to_string(ack);
+	json_object_unref(ack);
 	discord_fetch_url(da, url, postdata, discord_got_ack_token, NULL);
 	g_free(postdata);
 	g_free(url);
@@ -8782,7 +8837,9 @@ discord_conversation_send_image(DiscordAccount *da, guint64 room_id, PurpleImage
 	mimetype = g_strdup(purple_image_get_mimetype(image));
 
 	postdata = g_string_new(NULL);
-	g_string_append_printf(postdata, "------PurpleBoundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\nContent-Type: %s\r\n\r\n", purple_url_encode(filename), mimetype);
+	gchar *form_filename = discord_escape_form_filename(filename);
+	g_string_append_printf(postdata, "------PurpleBoundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\nContent-Type: %s\r\n\r\n", form_filename, mimetype);
+	g_free(form_filename);
 	g_string_append_len(postdata, purple_image_get_data(image), purple_image_get_data_size(image));
 	g_string_append_printf(postdata, "\r\n------PurpleBoundary\r\nContent-Disposition: form-data; name=\"payload_json\"\r\n\r\n{\"content\":\"\",\"nonce\":\"%s\",\"tts\":false}\r\n", nonce);
 	g_string_append(postdata, "------PurpleBoundary--\r\n");
@@ -10945,11 +11002,12 @@ discord_xfer_send_init(PurpleXfer *xfer)
 		// TODO afaik there's no way to get pidgin to close after a
 		// non-complete xfer :(
 		purple_xfer_cancel_local(xfer);
-		g_mapped_file_unref(file);
-		g_free(load_error);
+		if (file != NULL) {
+			g_mapped_file_unref(file);
+		}
+		g_error_free(load_error);
 		return;
 	}
-	g_free(load_error);
 
 	goffset file_len = g_mapped_file_get_length(file);
 	if (file_len > 10000000) {
@@ -10978,7 +11036,9 @@ discord_xfer_send_init(PurpleXfer *xfer)
 	nonce = g_strdup_printf("%" G_GUINT32_FORMAT, g_random_int());
 
 	postdata = g_string_new(NULL);
-	g_string_append_printf(postdata, "------PurpleBoundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\nContent-Type: %s\r\n\r\n", purple_url_encode(filename), mimetype);
+	gchar *form_filename = discord_escape_form_filename(filename);
+	g_string_append_printf(postdata, "------PurpleBoundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\nContent-Type: %s\r\n\r\n", form_filename, mimetype);
+	g_free(form_filename);
 	g_string_append_len(postdata, contents, file_len);
 	g_string_append_printf(postdata, "\r\n------PurpleBoundary\r\nContent-Disposition: form-data; name=\"payload_json\"\r\n\r\n{\"content\":\"\",\"nonce\":\"%s\",\"tts\":false}\r\n", nonce);
 	g_string_append(postdata, "------PurpleBoundary--\r\n");
@@ -11091,6 +11151,18 @@ discord_chat_can_receive_file(PurpleConnection *pc, int id) {
 }
 #endif
 
+static GSList *discord_cmd_ids = NULL;
+
+/* Keeps the id so the command can be unregistered when the plugin unloads */
+static void
+discord_cmd_register(const gchar *cmd, const gchar *args, PurpleCmdPriority p, PurpleCmdFlag f,
+                     const gchar *protocol_id, PurpleCmdFunc func, const gchar *helpstr, void *data)
+{
+	PurpleCmdId id = purple_cmd_register(cmd, args, p, f, protocol_id, func, helpstr, data);
+
+	discord_cmd_ids = g_slist_prepend(discord_cmd_ids, GUINT_TO_POINTER(id));
+}
+
 static gboolean
 plugin_load(PurplePlugin *plugin, GError **error)
 {
@@ -11105,133 +11177,133 @@ plugin_load(PurplePlugin *plugin, GError **error)
 	discord_spaced_mention_regex = g_regex_new("(?:^|\\s)@([^\\s@]+ [^\\s@]+)\\b", G_REGEX_OPTIMIZE, 0, NULL);
 	discord_timestamp_regex = g_regex_new("&lt;t:(\\d+)(:\\w)?&gt;", G_REGEX_OPTIMIZE, 0, NULL);
 
-	purple_cmd_register(
+	discord_cmd_register(
 		"reply", "S", PURPLE_CMD_P_PLUGIN,
 		PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
 		DISCORD_PLUGIN_ID, discord_cmd_reply,
 		_("reply &lt;timestamp&gt; &lt;message&gt;:  Replies to the message at &lt;timestamp&gt; with &lt;message&gt;<br />Accepted timestamp formats: YYYY-MM-DDthh:mm:ss, YYYY-MM-DDThh:mm:ss, hh:mm:ss"), NULL
 	);
 
-	purple_cmd_register(
+	discord_cmd_register(
 		"react", "ws", PURPLE_CMD_P_PLUGIN,
 		PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
 		DISCORD_PLUGIN_ID, discord_cmd_react,
 		_("react &lt;timestamp&gt; &lt;emoji&gt;:  Reacts to the message at &lt;timestamp&gt; with &lt;emoji&gt;<br />Accepted timestamp formats: YYYY-MM-DDthh:mm:ss, YYYY-MM-DDThh:mm:ss, hh:mm:ss"), NULL
 	);
 
-	purple_cmd_register(
+	discord_cmd_register(
 		"unreact", "ws", PURPLE_CMD_P_PLUGIN,
 		PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
 		DISCORD_PLUGIN_ID, discord_cmd_unreact,
 		_("unreact &lt;timestamp&gt; &lt;emoji&gt;:  Removes the reaction &lt;emoji&gt; from the message at &lt;timestamp&gt;<br />Accepted timestamp formats: YYYY-MM-DDthh:mm:ss, YYYY-MM-DDThh:mm:ss, hh:mm:ss"), NULL
 	);
 
-	purple_cmd_register(
+	discord_cmd_register(
 		"nick", "s", PURPLE_CMD_P_PLUGIN,
 		PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
 		DISCORD_PLUGIN_ID, discord_cmd_nick,
 		_("nick &lt;new nickname&gt;:  Changes nickname on a server"), NULL
 	);
 
-	purple_cmd_register(
+	discord_cmd_register(
 		"kick", "s", PURPLE_CMD_P_PLUGIN,
 		PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
 		DISCORD_PLUGIN_ID, discord_cmd_kick,
 		_("kick &lt;username&gt;:  Remove someone from a server"), NULL
 	);
 
-	purple_cmd_register(
+	discord_cmd_register(
 		"ban", "s", PURPLE_CMD_P_PLUGIN,
 		PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
 		DISCORD_PLUGIN_ID, discord_cmd_ban,
 		_("ban &lt;username&gt;:  Remove someone from a server and prevent them rejoining"), NULL
 	);
 
-	purple_cmd_register(
+	discord_cmd_register(
 		"leave", "", PURPLE_CMD_P_PLUGIN,
 		PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
 		DISCORD_PLUGIN_ID, discord_cmd_leave,
 		_("leave:  Leave the channel"), NULL
 	);
 
-	purple_cmd_register(
+	discord_cmd_register(
 		"part", "", PURPLE_CMD_P_PLUGIN,
 		PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
 		DISCORD_PLUGIN_ID, discord_cmd_leave,
 		_("part:  Leave the channel"), NULL
 	);
 
-	purple_cmd_register(
+	discord_cmd_register(
 		"pinned", "", PURPLE_CMD_P_PLUGIN,
 		PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
 		DISCORD_PLUGIN_ID, discord_cmd_pinned,
 		_("pinned:  Display pinned messages"), NULL
 	);
 
-	purple_cmd_register(
+	discord_cmd_register(
 		"roles", "", PURPLE_CMD_P_PLUGIN,
 		PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
 		DISCORD_PLUGIN_ID, discord_cmd_roles,
 		_("roles:  Display server roles"), NULL
 	);
 
-	purple_cmd_register(
+	discord_cmd_register(
 		"thread", "S", PURPLE_CMD_P_PLUGIN,
 		PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
 		DISCORD_PLUGIN_ID, discord_cmd_thread,
 		_("thread &lt;timestamp&gt; &lt;message&gt;:  Sends message to thread<br />Accepted timestamp formats: YYYY-MM-DDthh:mm:ss, YYYY-MM-DDThh:mm:ss, hh:mm:ss"), NULL
 	);
 
-	purple_cmd_register(
+	discord_cmd_register(
 			"threads", "", PURPLE_CMD_P_PLUGIN,
 			PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
 						DISCORD_PLUGIN_ID, discord_cmd_threads,
 						_("threads:  Display active channel threads"), NULL
 	);
 
-	purple_cmd_register(
+	discord_cmd_register(
 			"threadhistory", "w", PURPLE_CMD_P_PLUGIN,
 			PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
 						DISCORD_PLUGIN_ID, discord_cmd_thread_history,
 						_("threadhistory &lt;timestamp&gt;:  Retrieves full history of thread"), NULL
 	);
 
-	purple_cmd_register(
+	discord_cmd_register(
 			"thist", "w", PURPLE_CMD_P_PLUGIN,
 			PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
 						DISCORD_PLUGIN_ID, discord_cmd_thread_history,
 						_("thist &lt;timestamp&gt;:  Retrieves full history of thread.<br />Alias of threadhistory"), NULL
 	);
 
-	purple_cmd_register(
+	discord_cmd_register(
 			"grabhistory", "", PURPLE_CMD_P_PLUGIN,
 			PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
 						DISCORD_PLUGIN_ID, discord_cmd_get_history,
 						_("grabhistory:  Retrieves full history of channel. Intended for rules channels and the like. Using this on old, highly active channels is not recommended"), NULL
 	);
 
-	purple_cmd_register(
+	discord_cmd_register(
 			"hist", "", PURPLE_CMD_P_PLUGIN,
 			PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY,
 						DISCORD_PLUGIN_ID, discord_cmd_get_history,
 						_("hist:  Retrieves full history of channel. Intended for rules channels and the like. Using this on old, highly active channels is not recommended.<br />Alias of grabhistory"), NULL
 	);
 
-	purple_cmd_register(
+	discord_cmd_register(
 			"servername", "", PURPLE_CMD_P_PLUGIN,
 			PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY,
 						DISCORD_PLUGIN_ID, discord_cmd_get_server_name,
 						_("servername:  Displays the name of the server for the current channel."), NULL
 	);
 
-	purple_cmd_register(
+	discord_cmd_register(
 			"server", "", PURPLE_CMD_P_PLUGIN,
 			PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY,
 						DISCORD_PLUGIN_ID, discord_cmd_get_server_name,
 						_("server:  Displays the name of the server for the current channel."), NULL
 	);
 
-	purple_cmd_register(
+	discord_cmd_register(
 			"joinserver", "s", PURPLE_CMD_P_PLUGIN,
 			PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_IM | PURPLE_CMD_FLAG_PROTOCOL_ONLY,
 						DISCORD_PLUGIN_ID, discord_cmd_join_server,
@@ -11239,21 +11311,21 @@ plugin_load(PurplePlugin *plugin, GError **error)
 	);
 
 #if 0
-	purple_cmd_register(
+	discord_cmd_register(
 		"mute", "s", PURPLE_CMD_P_PLUGIN,
 		PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
 		DISCORD_PLUGIN_ID, discord_slash_command,
 		_("mute <username>:  Mute someone in channel"), NULL
 	);
 
-	purple_cmd_register(
+	discord_cmd_register(
 		"unmute", "s", PURPLE_CMD_P_PLUGIN,
 		PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
 		DISCORD_PLUGIN_ID, discord_slash_command,
 		_("unmute <username>:  Un-mute someone in channel"), NULL
 	);
 
-	purple_cmd_register(
+	discord_cmd_register(
 		"topic", "s", PURPLE_CMD_P_PLUGIN,
 		PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
 		DISCORD_PLUGIN_ID, discord_slash_command,
@@ -11268,6 +11340,11 @@ static gboolean
 plugin_unload(PurplePlugin *plugin, GError **error)
 {
 	purple_signals_disconnect_by_handle(plugin);
+
+	while (discord_cmd_ids) {
+		purple_cmd_unregister(GPOINTER_TO_UINT(discord_cmd_ids->data));
+		discord_cmd_ids = g_slist_delete_link(discord_cmd_ids, discord_cmd_ids);
+	}
 
 	g_regex_unref(channel_mentions_regex);
 	g_regex_unref(role_mentions_regex);

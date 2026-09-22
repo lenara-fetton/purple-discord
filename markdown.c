@@ -152,6 +152,12 @@ markdown_convert_markdown(const gchar *html, gboolean escape_html, gboolean disc
 		}
 
 		if (c == '\\') {
+			if (html[i + 1] == '\0') {
+				/* Trailing backslash: nothing to escape */
+				out = g_string_append_c(out, '\\');
+				break;
+			}
+
 			char next_char = html[++i];
 
 			/* If this is an escape-able character, don't print the
