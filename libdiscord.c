@@ -458,6 +458,7 @@ typedef struct {
 	GHashTable *own_reactions;      /* message id -> set of API emoji ("name" or "name:id") (bounded) */
 	GQueue *own_reactions_order;
 	GHashTable *custom_emoji;       /* custom emoji name -> id, as seen in messages and reactions */
+	GHashTable *read_acked;         /* channel id -> newest message id read (acked by us or another client) */
 
 } DiscordAccount;
 
@@ -3083,6 +3084,7 @@ discord_native_init(DiscordAccount *da)
 	da->own_reactions = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify) g_hash_table_unref);
 	da->own_reactions_order = g_queue_new();
 	da->custom_emoji = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	da->read_acked = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
 
 	purple_debug_info("discord", "UI supports message-meta: native replies, edits, reactions and deletes\n");
 }
@@ -3100,6 +3102,8 @@ discord_native_free(DiscordAccount *da)
 	g_hash_table_destroy(da->own_reactions);
 	g_queue_free_full(da->own_reactions_order, g_free);
 	g_hash_table_destroy(da->custom_emoji);
+	g_hash_table_destroy(da->read_acked);
+	da->read_acked = NULL;
 	da->deferred_echo = da->msg_info = da->own_reactions = da->custom_emoji = NULL;
 	da->msg_info_order = da->own_reactions_order = NULL;
 	da->native_meta = FALSE;
@@ -3955,12 +3959,82 @@ discord_native_before_write(DiscordAccount *da, JsonObject *data, const gchar *c
 
 	discord_meta_set_embed(meta, data);
 
+	if (special_type == DISCORD_MESSAGE_NORMAL && !outgoing &&
+	    to_int(json_object_get_string_member(json_object_get_object_member(data, "author"), "id")) != da->self_user_id) {
+		/* The UI sends send-marker for it when it has been seen */
+		discord_meta_set(meta, "markable", "1");
+	}
+
 	if (discord_emit_message_meta(da, conv_name, meta)) {
 		purple_debug_info("discord", "Message %s is shown already\n", json_object_get_string_member(data, "id"));
 		return TRUE;
 	}
 
 	return FALSE;
+}
+
+/* The newest message known to be read in @channel_id (0: none) */
+static guint64
+discord_native_read_get(DiscordAccount *da, guint64 channel_id)
+{
+	guint64 *id = g_hash_table_lookup(da->read_acked, &channel_id);
+
+	return id ? *id : 0;
+}
+
+/* Notes that @msg_id and everything before it in @channel_id is read.
+ * FALSE if that was known already. */
+static gboolean
+discord_native_read_set(DiscordAccount *da, guint64 channel_id, guint64 msg_id)
+{
+	if (msg_id == 0 || msg_id <= discord_native_read_get(da, channel_id)) {
+		return FALSE;
+	}
+
+	g_hash_table_replace(da->read_acked, g_memdup2(&channel_id, sizeof(guint64)),
+	                     g_memdup2(&msg_id, sizeof(guint64)));
+	return TRUE;
+}
+
+/*
+ * MESSAGE_ACK: we read a channel up to a message on another client (or
+ * this one). Emits message-receipt(account, conv, message id, "displayed",
+ * our account name), which a message-meta UI takes as "read elsewhere" and
+ * clears the conversation's unread state. Thread acks are skipped: the UI
+ * shows threads inside their parent channel's conversation.
+ */
+static void
+discord_native_message_ack(DiscordAccount *da, JsonObject *data)
+{
+	guint64 channel_id = to_int(json_object_get_string_member(data, "channel_id"));
+	const gchar *msg_id = json_object_get_string_member(data, "message_id");
+	gchar *channel_id_s, *conv_name;
+	gboolean is_chat;
+
+	if (channel_id == 0 || msg_id == NULL || to_int(msg_id) == 0) {
+		return;
+	}
+
+	channel_id_s = from_int(channel_id);
+
+	if (!g_hash_table_contains(da->one_to_ones, channel_id_s) &&
+	    discord_get_channel_global_int(da, channel_id) == NULL &&
+	    discord_get_thread_global_int_guild(da, channel_id, NULL) != NULL) {
+		g_free(channel_id_s);
+		return;
+	}
+
+	g_free(channel_id_s);
+
+	if (!discord_native_read_set(da, channel_id, to_int(msg_id))) {
+		/* Known already: the echo of our own ack, or an older one */
+		return;
+	}
+
+	conv_name = discord_native_conv_name(da, channel_id, &is_chat);
+	purple_signal_emit_return_1(purple_conversations_get_handle(), "message-receipt",
+		da->account, conv_name, msg_id, "displayed", purple_account_get_username(da->account));
+	g_free(conv_name);
 }
 
 /* Remembers which reactions on a message are ours (for send-reaction) */
@@ -5648,6 +5722,10 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 		discord_set_group_typing(&ctx);
 
 		g_free(n);
+	} else if (da->native_meta && purple_strequal(type, "MESSAGE_ACK")) {
+		/* Read on another client: the UI clears the unread state */
+		discord_native_message_ack(da, data);
+
 	} else if (purple_strequal(type, "MESSAGE_DELETE") || purple_strequal(type, "MESSAGE_DELETE_BULK")) {
 
 		const gchar *channel_id_s = json_object_get_string_member(data, "channel_id");
@@ -9855,6 +9933,38 @@ discord_mark_room_messages_read(DiscordAccount *da, guint64 channel_id)
 	g_free(url);
 }
 
+/* Acks @msg_id in @channel_id (native_meta: send-marker). FALSE if it was
+ * read already. */
+static gboolean
+discord_native_ack_message(DiscordAccount *da, guint64 channel_id, guint64 msg_id)
+{
+	JsonObject *ack;
+	gchar *url, *postdata;
+
+	if (!discord_native_read_set(da, channel_id, msg_id)) {
+		return FALSE;
+	}
+
+	/* As the conversation-updated ack does: history fetches start here */
+	discord_set_room_last_id(da, channel_id, msg_id);
+
+	url = g_strdup_printf("https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/channels/%" G_GUINT64_FORMAT "/messages/%" G_GUINT64_FORMAT "/ack", channel_id, msg_id);
+	ack = json_object_new();
+
+	if (da->ack_token) {
+		json_object_set_string_member(ack, "token", da->ack_token);
+	} else {
+		json_object_set_null_member(ack, "token");
+	}
+
+	postdata = json_object_to_string(ack);
+	json_object_unref(ack);
+	discord_fetch_url(da, url, postdata, discord_got_ack_token, NULL);
+	g_free(postdata);
+	g_free(url);
+	return TRUE;
+}
+
 static void
 discord_mark_conv_seen(PurpleConversation *conv, PurpleConversationUpdateType type)
 {
@@ -9876,6 +9986,12 @@ discord_mark_conv_seen(PurpleConversation *conv, PurpleConversationUpdateType ty
 	}
 
 	da = purple_connection_get_protocol_data(pc);
+
+	if (da->native_meta) {
+		/* The UI acks what it has shown with send-marker */
+		return;
+	}
+
 	guint64 room_id = discord_get_channel_id_from_conv(da, conv);
 
 	if (room_id != 0) {
@@ -12700,7 +12816,7 @@ plugin_unload(PurplePlugin *plugin, GError **error)
  * gateway (MESSAGE_UPDATE, MESSAGE_REACTION_*, MESSAGE_DELETE, and the
  * echo of the reply) like changes made in any other client.
  *
- * No send-marker: the conversation's unseen update acks the channel already.
+ * send-marker (below) acks the channel.
  */
 
 static DiscordAccount *
@@ -12929,6 +13045,35 @@ discord_ipc_send_reply(PurpleAccount *account, const gchar *conv_name, const gch
 	return ret > 0;
 }
 
+/*
+ * gboolean send-marker(PurpleAccount *, const char *conv_name, const char *message_id, const char *marker)
+ *
+ * The UI has shown everything up to @message_id: acks it
+ * (POST /channels/{id}/messages/{id}/ack), unless that channel is known to
+ * be read that far (acked before, or MESSAGE_ACK from another client).
+ * @marker is "displayed" (NULL or "" too) or "acknowledged"; Discord has no
+ * "received". With a message-meta UI this replaces the ack on the
+ * conversation's unseen update, so each read is acked once.
+ */
+static gboolean
+discord_ipc_send_marker(PurpleAccount *account, const gchar *conv_name, const gchar *message_id, const gchar *marker)
+{
+	DiscordAccount *da = discord_ipc_account(account);
+	guint64 room_id, msg_id = message_id ? to_int(message_id) : 0;
+
+	if (da == NULL || msg_id == 0 || (room_id = discord_ipc_room(da, conv_name, NULL)) == 0) {
+		return FALSE;
+	}
+
+	if (marker != NULL && *marker != '\0' && !purple_strequal(marker, "displayed") &&
+	    !purple_strequal(marker, "acknowledged")) {
+		return FALSE;
+	}
+
+	discord_native_ack_message(da, discord_ipc_message_channel(da, room_id, message_id), msg_id);
+	return TRUE;
+}
+
 static void
 discord_ipc_register(PurplePlugin *plugin)
 {
@@ -12969,8 +13114,17 @@ discord_ipc_register(PurplePlugin *plugin)
 			purple_value_new(PURPLE_TYPE_STRING),
 			purple_value_new(PURPLE_TYPE_STRING));
 
+	purple_plugin_ipc_register(plugin, "send-marker",
+			PURPLE_CALLBACK(discord_ipc_send_marker),
+			purple_marshal_BOOLEAN__POINTER_POINTER_POINTER_POINTER,
+			purple_value_new(PURPLE_TYPE_BOOLEAN), 4,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+
 	purple_debug_info("discord", "Registered IPC commands send-correction, send-reaction, "
-	                  "send-retraction and send-reply\n");
+	                  "send-retraction, send-reply and send-marker\n");
 }
 
 // Normally set in core.c in purple3
