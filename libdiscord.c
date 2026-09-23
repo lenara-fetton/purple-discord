@@ -460,6 +460,11 @@ typedef struct {
 	GHashTable *custom_emoji;       /* custom emoji name -> id, as seen in messages and reactions */
 	GHashTable *read_acked;         /* channel id -> newest message id read (acked by us or another client) */
 	gboolean history_older;         /* processing a mam-fetch-older page */
+	GQueue *reaction_msgs;          /* DiscordReactionMsg: history messages whose reactors to fetch */
+	guint reaction_timer;           /* the next reactors request */
+	gboolean reaction_busy;         /* a reactors request is out */
+	gint reaction_rl_remaining;     /* X-RateLimit-Remaining of the last reactors request, -1: unknown */
+	gdouble reaction_rl_reset_after;        /* X-RateLimit-Reset-After of it, seconds */
 
 } DiscordAccount;
 
@@ -1660,6 +1665,19 @@ discord_cookies_to_string(DiscordAccount *ya)
 
 static void discord_fetch_url_with_method_delay_len(DiscordAccount *da, const gchar *method, const gchar *url, const gchar *postdata, gsize postdata_len, DiscordProxyCallbackFunc callback, gpointer user_data, guint delay);
 
+/* The rate limit state of the reactors endpoint (native_meta): its
+ * X-RateLimit-Remaining and X-RateLimit-Reset-After headers */
+static void
+discord_native_note_rate_limit(DiscordAccount *da, const gchar *remaining, const gchar *reset_after)
+{
+	da->reaction_rl_remaining = remaining ? (gint) g_ascii_strtoll(remaining, NULL, 10) : -1;
+	da->reaction_rl_reset_after = reset_after ? g_ascii_strtod(reset_after, NULL) : 0;
+
+	if (da->reaction_rl_reset_after < 0 || da->reaction_rl_reset_after > 600) {
+		da->reaction_rl_reset_after = 5;
+	}
+}
+
 static void
 discord_response_callback(PurpleHttpConnection *http_conn,
 							PurpleHttpResponse *response, gpointer user_data)
@@ -1676,6 +1694,12 @@ discord_response_callback(PurpleHttpConnection *http_conn,
 
 	discord_update_cookies(conn->ya, purple_http_response_get_headers_by_name(response, "Set-Cookie"));
 	int response_code = purple_http_response_get_code(response);
+
+	if (conn->ya->native_meta && request_url != NULL && strstr(request_url, "/reactions/") != NULL) {
+		discord_native_note_rate_limit(conn->ya,
+			purple_http_response_get_header(response, "X-RateLimit-Remaining"),
+			purple_http_response_get_header(response, "X-RateLimit-Reset-After"));
+	}
 
 	if (response_code == 429 && request != NULL) {
 		gdouble retry_after = 5;
@@ -3067,6 +3091,38 @@ discord_msg_info_free(gpointer data)
 	}
 }
 
+/* A history message whose reactors are still to be fetched (native_meta) */
+typedef struct {
+	guint64 channel_id;     /* the message's own channel (a thread's for thread messages) */
+	gchar *msg_id;
+	GQueue emojis;          /* DiscordReactionEmoji */
+} DiscordReactionMsg;
+
+typedef struct {
+	gchar *api;             /* "name" or "name:id", for the endpoint */
+	gchar *display;         /* the UI's form: the emoji, or ":name:" */
+} DiscordReactionEmoji;
+
+static void
+discord_reaction_emoji_free(gpointer data)
+{
+	DiscordReactionEmoji *emoji = data;
+
+	g_free(emoji->api);
+	g_free(emoji->display);
+	g_free(emoji);
+}
+
+static void
+discord_reaction_msg_free(gpointer data)
+{
+	DiscordReactionMsg *msg = data;
+
+	g_free(msg->msg_id);
+	g_queue_clear_full(&msg->emojis, discord_reaction_emoji_free);
+	g_free(msg);
+}
+
 static void
 discord_native_init(DiscordAccount *da)
 {
@@ -3086,6 +3142,8 @@ discord_native_init(DiscordAccount *da)
 	da->own_reactions_order = g_queue_new();
 	da->custom_emoji = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 	da->read_acked = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
+	da->reaction_msgs = g_queue_new();
+	da->reaction_rl_remaining = -1;
 
 	purple_debug_info("discord", "UI supports message-meta: native replies, edits, reactions and deletes\n");
 }
@@ -3105,6 +3163,14 @@ discord_native_free(DiscordAccount *da)
 	g_hash_table_destroy(da->custom_emoji);
 	g_hash_table_destroy(da->read_acked);
 	da->read_acked = NULL;
+
+	if (da->reaction_timer) {
+		purple_timeout_remove(da->reaction_timer);
+		da->reaction_timer = 0;
+	}
+
+	g_queue_free_full(da->reaction_msgs, discord_reaction_msg_free);
+	da->reaction_msgs = NULL;
 	da->deferred_echo = da->msg_info = da->own_reactions = da->custom_emoji = NULL;
 	da->msg_info_order = da->own_reactions_order = NULL;
 	da->native_meta = FALSE;
@@ -4133,6 +4199,174 @@ discord_native_reaction(DiscordAccount *da, JsonObject *data, gboolean add)
 	return handled;
 }
 
+/*
+ * Reactions on history messages (native_meta). The message object only
+ * has counts, so the reactors of each emoji are fetched
+ * (GET .../reactions/{emoji}?limit=100) and passed on as
+ * message-reaction(..., add = TRUE), one per user. Only the newest
+ * "reaction_history_limit" (default 25) messages queued are fetched, one
+ * request at a time, at most about three a second, and slower when the
+ * endpoint's X-RateLimit-Remaining reaches 0 (until its Reset-After).
+ */
+#define DISCORD_REACTION_INTERVAL_MS 350
+
+typedef struct {
+	guint64 channel_id;
+	gchar *msg_id;
+	DiscordReactionEmoji *emoji;
+} DiscordReactionFetch;
+
+static gboolean discord_native_reactions_next(gpointer data);
+
+static void
+discord_native_reactions_kick(DiscordAccount *da)
+{
+	guint delay = DISCORD_REACTION_INTERVAL_MS;
+
+	if (da->reaction_msgs == NULL || da->reaction_busy || da->reaction_timer != 0 ||
+	    g_queue_is_empty(da->reaction_msgs)) {
+		return;
+	}
+
+	if (da->reaction_rl_remaining == 0) {
+		delay = MAX(delay, (guint) (da->reaction_rl_reset_after * 1000));
+	}
+
+	da->reaction_timer = purple_timeout_add(delay, discord_native_reactions_next, da);
+}
+
+static void
+discord_native_reactors_cb(DiscordAccount *da, JsonNode *node, gpointer user_data)
+{
+	DiscordReactionFetch *fetch = user_data;
+	JsonArray *users = (node != NULL && JSON_NODE_HOLDS_ARRAY(node)) ? json_node_get_array(node) : NULL;
+	guint i, len = users ? json_array_get_length(users) : 0;
+	gboolean is_chat;
+	gchar *conv_name = NULL;
+
+	if (len > 0 && da->reaction_msgs != NULL) {
+		conv_name = discord_native_conv_name(da, fetch->channel_id, &is_chat);
+	}
+
+	for (i = 0; conv_name != NULL && i < len; i++) {
+		JsonObject *user_obj = json_array_get_object_element(users, i);
+		guint64 user_id = to_int(json_object_get_string_member(user_obj, "id"));
+		gchar *sender;
+
+		if (user_id == 0) {
+			continue;
+		}
+
+		if (discord_get_user(da, user_id) == NULL) {
+			discord_upsert_user(da->new_users, user_obj);
+		}
+
+		if (user_id == da->self_user_id) {
+			discord_own_reactions_update(da, fetch->msg_id, fetch->emoji->api, TRUE);
+		}
+
+		sender = discord_native_sender(da, fetch->channel_id, user_id, is_chat);
+
+		if (sender != NULL) {
+			discord_emit_reaction(da, conv_name, fetch->msg_id, fetch->emoji->display, sender, TRUE);
+		}
+
+		g_free(sender);
+	}
+
+	g_free(conv_name);
+	g_free(fetch->msg_id);
+	discord_reaction_emoji_free(fetch->emoji);
+	g_free(fetch);
+
+	if (da->reaction_msgs != NULL) {
+		da->reaction_busy = FALSE;
+		discord_native_reactions_kick(da);
+	}
+}
+
+static gboolean
+discord_native_reactions_next(gpointer data)
+{
+	DiscordAccount *da = data;
+	DiscordReactionMsg *msg = g_queue_peek_head(da->reaction_msgs);
+	DiscordReactionFetch *fetch;
+	gchar *url;
+
+	da->reaction_timer = 0;
+
+	if (msg == NULL) {
+		return FALSE;
+	}
+
+	fetch = g_new0(DiscordReactionFetch, 1);
+	fetch->channel_id = msg->channel_id;
+	fetch->msg_id = g_strdup(msg->msg_id);
+	fetch->emoji = g_queue_pop_head(&msg->emojis);
+
+	if (g_queue_is_empty(&msg->emojis)) {
+		discord_reaction_msg_free(g_queue_pop_head(da->reaction_msgs));
+	}
+
+	url = g_strdup_printf("https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/channels/%" G_GUINT64_FORMAT "/messages/%s/reactions/%s?limit=100",
+	                      fetch->channel_id, fetch->msg_id, purple_url_encode(fetch->emoji->api));
+	da->reaction_busy = TRUE;
+	discord_fetch_url(da, url, NULL, discord_native_reactors_cb, fetch);
+	g_free(url);
+
+	return FALSE;
+}
+
+/* Queues the reactors of @msg_id's @reactions (a history message) */
+static void
+discord_native_queue_reactions(DiscordAccount *da, guint64 channel_id, const gchar *msg_id, JsonArray *reactions)
+{
+	gint limit = purple_account_get_int(da->account, "reaction_history_limit", 25);
+	guint n, len = reactions ? json_array_get_length(reactions) : 0;
+	DiscordReactionMsg *msg;
+
+	if (limit <= 0 || len == 0 || msg_id == NULL || channel_id == 0) {
+		return;
+	}
+
+	msg = g_new0(DiscordReactionMsg, 1);
+	msg->channel_id = channel_id;
+	msg->msg_id = g_strdup(msg_id);
+	g_queue_init(&msg->emojis);
+
+	for (n = 0; n < len; n++) {
+		JsonObject *emoji_obj = json_object_get_object_member(json_array_get_object_element(reactions, n), "emoji");
+		DiscordReactionEmoji *emoji;
+		gchar *api = discord_reaction_emoji_api_from_json(emoji_obj);
+		gchar *display = discord_reaction_emoji_display(da, emoji_obj);
+
+		if (api == NULL || display == NULL) {
+			g_free(api);
+			g_free(display);
+			continue;
+		}
+
+		emoji = g_new0(DiscordReactionEmoji, 1);
+		emoji->api = api;
+		emoji->display = display;
+		g_queue_push_tail(&msg->emojis, emoji);
+	}
+
+	if (g_queue_is_empty(&msg->emojis)) {
+		discord_reaction_msg_free(msg);
+		return;
+	}
+
+	g_queue_push_tail(da->reaction_msgs, msg);
+
+	/* Only the newest @limit messages */
+	while (g_queue_get_length(da->reaction_msgs) > (guint) limit) {
+		discord_reaction_msg_free(g_queue_pop_head(da->reaction_msgs));
+	}
+
+	discord_native_reactions_kick(da);
+}
+
 static guint64
 discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_type)
 {
@@ -4752,9 +4986,15 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 
 		if (native) {
 			discord_native_note_own_reactions(da, msg_id_s, reactions);
+
+			if (reactions != NULL && !native_discard && special_type == DISCORD_MESSAGE_NORMAL &&
+			    purple_account_get_bool(da->account, "show-reactions", TRUE)) {
+				/* Who reacted, on the message itself */
+				discord_native_queue_reactions(da, id, msg_id_s, reactions);
+			}
 		}
 
-		if (reactions != NULL && !native_discard && purple_account_get_bool(da->account, "show-reactions", TRUE)) {
+		if (reactions != NULL && !native && purple_account_get_bool(da->account, "show-reactions", TRUE)) {
 			const gchar *username = g_hash_table_lookup(da->one_to_ones, channel_id_s);
 
 			guint reactions_len = json_array_get_length(reactions);
@@ -5016,9 +5256,15 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 
 		if (native) {
 			discord_native_note_own_reactions(da, msg_id_s, reactions);
+
+			if (reactions != NULL && !native_discard && special_type == DISCORD_MESSAGE_NORMAL &&
+			    purple_account_get_bool(da->account, "show-reactions", TRUE)) {
+				/* Who reacted, on the message itself */
+				discord_native_queue_reactions(da, id, msg_id_s, reactions);
+			}
 		}
 
-		if (reactions != NULL && !native_discard && purple_account_get_bool(da->account, "show-reactions", TRUE)) {
+		if (reactions != NULL && !native && purple_account_get_bool(da->account, "show-reactions", TRUE)) {
 			if (conv == NULL) {
 				PurpleChatConversation *chatconv = purple_conversations_find_chat(da->pc, discord_chat_hash(channel_id));
 				conv = PURPLE_CONVERSATION(chatconv);
@@ -11304,6 +11550,16 @@ discord_add_account_options(GList *account_options)
 
 	option = purple_account_option_bool_new(_("Fetch names for reactors to backlogged messages (can be spammy)"), "fetch-react-backlog", FALSE);
 	account_options = g_list_append(account_options, option);
+
+	{
+		/* Only a UI with native message metadata shows reactions on history messages */
+		GHashTable *ui_info = purple_core_get_ui_info();
+
+		if (ui_info != NULL && purple_strequal(g_hash_table_lookup(ui_info, "message-meta"), "1")) {
+			option = purple_account_option_int_new(_("Fetch who reacted to this many history messages (0 disables)"), "reaction_history_limit", 25);
+			account_options = g_list_append(account_options, option);
+		}
+	}
 
 	option = purple_account_option_bool_new(_("Fetch unread chat messages when account connects"), "fetch-unread-on-start", TRUE);
 	account_options = g_list_append(account_options, option);
