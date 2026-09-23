@@ -5749,6 +5749,68 @@ discord_handle_guild_member_update(DiscordAccount *da, guint64 guild_id, JsonObj
 
 static void discord_send_lazy_guild_request(DiscordAccount *da, DiscordGuild *guild);
 
+/* Activity types that are a game or a stream, song or show: playing,
+ * streaming, listening, watching, competing (not 4, a custom status) */
+#define DISCORD_ACTIVITY_IS_GAME(type) ((type) == 0 || (type) == 1 || (type) == 2 || (type) == 3 || (type) == 5)
+
+/* The first game-like activity of a presence (PRESENCE_UPDATE data or a
+ * READY presence), or its legacy "game" object; NULL for none */
+static JsonObject *
+discord_presence_game_activity(JsonObject *presence)
+{
+	JsonArray *activities = json_object_get_array_member(presence, "activities");
+	JsonObject *game;
+	guint n, len = activities ? json_array_get_length(activities) : 0;
+
+	for (n = 0; n < len; n++) {
+		JsonObject *activity = json_array_get_object_element(activities, n);
+
+		if (activity != NULL && json_object_get_string_member(activity, "name") != NULL &&
+		    DISCORD_ACTIVITY_IS_GAME(json_object_get_int_member(activity, "type"))) {
+			return activity;
+		}
+	}
+
+	game = json_object_get_object_member(presence, "game");
+
+	if (game != NULL && json_object_get_string_member(game, "name") != NULL &&
+	    !purple_strequal(json_object_get_string_member(game, "id"), "custom") &&
+	    DISCORD_ACTIVITY_IS_GAME(json_object_get_int_member(game, "type"))) {
+		return game;
+	}
+
+	return NULL;
+}
+
+/*
+ * purple_prpl_got_user_status() for a buddy. With native metadata (and
+ * status types that have them, see discord_status_types()) the status also
+ * gets the "game" (the activity's name) and "game_app_id" (its
+ * application_id) attributes from @presence, which pidgin4 shows on the
+ * buddy row and in the tooltip; they are unset without a game.
+ */
+static void
+discord_got_user_status(DiscordAccount *da, const gchar *username, const gchar *status,
+                        const gchar *message, JsonObject *presence)
+{
+	PurpleStatusType *type = (da->native_meta && status != NULL) ? purple_account_get_status_type(da->account, status) : NULL;
+
+	if (type != NULL && purple_status_type_get_attr(type, "game") != NULL) {
+		JsonObject *game = presence ? discord_presence_game_activity(presence) : NULL;
+		const gchar *game_name = game ? json_object_get_string_member(game, "name") : NULL;
+		const gchar *app_id = game ? json_object_get_string_member(game, "application_id") : NULL;
+
+		if (purple_strequal(status, "offline")) {
+			game_name = app_id = NULL;
+		}
+
+		purple_protocol_got_user_status(da->account, username, status, "message", message,
+		                                "game", game_name, "game_app_id", app_id, NULL);
+	} else {
+		purple_protocol_got_user_status(da->account, username, status, "message", message, NULL);
+	}
+}
+
 static void
 discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data)
 {
@@ -5807,7 +5869,7 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 
 		} else if (username) {
 			const gchar *status = json_object_get_string_member(data, "status");
-			purple_protocol_got_user_status(da->account, username, status, "message", user->game ? user->game : user->custom_status, NULL);
+			discord_got_user_status(da, username, status, user->game ? user->game : user->custom_status, data);
 			purple_protocol_got_user_idle(da->account, username, idle_since ? TRUE : FALSE, 0);
 
 			// Check avatar updates
@@ -5862,7 +5924,7 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 				}
 
 				// Change status to the new user
-				purple_protocol_got_user_status(da->account, new_username_full, status, "message", user->game ? user->game : user->custom_status, NULL);
+				discord_got_user_status(da, new_username_full, status, user->game ? user->game : user->custom_status, data);
 				purple_protocol_got_user_idle(da->account, new_username_full, idle_since ? TRUE : FALSE, 0);
 				purple_protocol_got_user_status(da->account, username, "offline", NULL);
 
@@ -7358,7 +7420,7 @@ discord_got_presences(DiscordAccount *da, JsonNode *node, gpointer user_data)
 			game_name = json_object_get_string_member(game, "state");
 		}
 
-		purple_protocol_got_user_status(da->account, merged_username, status, "message", game_name, NULL);
+		discord_got_user_status(da, merged_username, status, game_name, presence);
 		purple_protocol_got_user_idle(da->account, merged_username, purple_strequal(status, "idle"), 0);
 
 		g_free(merged_username);
@@ -11186,29 +11248,49 @@ discord_list_icon(PurpleAccount *account, PurpleBuddy *buddy)
 	return "discord";
 }
 
+/* A status type with the "message" attribute and, with @game, "game" and
+ * "game_app_id" (see discord_got_user_status()) */
+static PurpleStatusType *
+discord_status_type_new(PurpleStatusPrimitive primitive, const gchar *id, const gchar *name,
+                        gboolean user_settable, gboolean independent, gboolean game)
+{
+	if (game) {
+		return purple_status_type_new_with_attrs(primitive, id, name, TRUE, user_settable, independent,
+			"message", _("Playing"), purple_value_new(PURPLE_TYPE_STRING),
+			"game", _("Game"), purple_value_new(PURPLE_TYPE_STRING),
+			"game_app_id", _("Game ID"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	}
+
+	return purple_status_type_new_with_attrs(primitive, id, name, TRUE, user_settable, independent,
+		"message", _("Playing"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+}
+
 static GList *
 discord_status_types(PurpleAccount *account)
 {
 	GList *types = NULL;
 	PurpleStatusType *status;
+	GHashTable *ui_info = purple_core_get_ui_info();
+	/* A message-meta UI (pidgin4) also shows friends' games */
+	gboolean game = ui_info != NULL && purple_strequal(g_hash_table_lookup(ui_info, "message-meta"), "1");
 
 	/* Other people can have an in-game display */
-	status = purple_status_type_new_with_attrs(PURPLE_STATUS_AVAILABLE, "online", _("Online"), TRUE, TRUE, FALSE, "message", _("Playing"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	status = discord_status_type_new(PURPLE_STATUS_AVAILABLE, "online", _("Online"), TRUE, FALSE, game);
 	types = g_list_append(types, status);
 
-	status = purple_status_type_new_with_attrs(PURPLE_STATUS_AWAY, "idle", _("Idle"), TRUE, TRUE, FALSE, "message", _("Playing"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	status = discord_status_type_new(PURPLE_STATUS_AWAY, "idle", _("Idle"), TRUE, FALSE, game);
 	types = g_list_append(types, status);
 
-	status = purple_status_type_new_with_attrs(PURPLE_STATUS_UNAVAILABLE, "dnd", _("Do Not Disturb"), TRUE, TRUE, FALSE, "message", _("Playing"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	status = discord_status_type_new(PURPLE_STATUS_UNAVAILABLE, "dnd", _("Do Not Disturb"), TRUE, FALSE, game);
 	types = g_list_append(types, status);
 
 	status = purple_status_type_new_full(PURPLE_STATUS_INVISIBLE, "set-invisible", _("Invisible"), TRUE, TRUE, FALSE);
 	types = g_list_append(types, status);
 
-	status = purple_status_type_new_with_attrs(PURPLE_STATUS_OFFLINE, "offline", _("Offline"), TRUE, FALSE, FALSE, "message", _("Playing"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	status = discord_status_type_new(PURPLE_STATUS_OFFLINE, "offline", _("Offline"), FALSE, FALSE, game);
 	types = g_list_append(types, status);
 
-	status = purple_status_type_new_with_attrs(PURPLE_STATUS_MOBILE, "mobile", _("Mobile"), TRUE, FALSE, TRUE, "message", _("Playing"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	status = discord_status_type_new(PURPLE_STATUS_MOBILE, "mobile", _("Mobile"), FALSE, TRUE, game);
 	types = g_list_append(types, status);
 
 
