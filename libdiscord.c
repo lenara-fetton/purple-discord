@@ -459,6 +459,7 @@ typedef struct {
 	GQueue *own_reactions_order;
 	GHashTable *custom_emoji;       /* custom emoji name -> id, as seen in messages and reactions */
 	GHashTable *read_acked;         /* channel id -> newest message id read (acked by us or another client) */
+	gboolean history_older;         /* processing a mam-fetch-older page */
 
 } DiscordAccount;
 
@@ -3959,6 +3960,12 @@ discord_native_before_write(DiscordAccount *da, JsonObject *data, const gchar *c
 
 	discord_meta_set_embed(meta, data);
 
+	if (da->history_older) {
+		/* A scroll-back page: the UI prepends it */
+		discord_meta_set(meta, "mam", "1");
+		discord_meta_set(meta, "mam-query", "older");
+	}
+
 	if (special_type == DISCORD_MESSAGE_NORMAL && !outgoing &&
 	    to_int(json_object_get_string_member(json_object_get_object_member(data, "author"), "id")) != da->self_user_id) {
 		/* The UI sends send-marker for it when it has been seen */
@@ -4227,6 +4234,11 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 		flags = PURPLE_MESSAGE_SEND | PURPLE_MESSAGE_REMOTE_SEND | PURPLE_MESSAGE_DELAYED;
 	} else {
 		flags = PURPLE_MESSAGE_RECV;
+	}
+
+	if (da->native_meta && da->history_older) {
+		/* A scroll-back page (mam-fetch-older) */
+		flags |= PURPLE_MESSAGE_DELAYED;
 	}
 
 	/* Check for mentions, but only if the user has not globally disabled
@@ -13045,6 +13057,97 @@ discord_ipc_send_reply(PurpleAccount *account, const gchar *conv_name, const gch
 	return ret > 0;
 }
 
+/* The plugin, for its own signal (mam-query-done) */
+static PurplePlugin *discord_plugin_handle = NULL;
+
+typedef struct {
+	PurpleAccount *account;
+	gchar *conv_name;
+	guint count;
+} DiscordOlderQuery;
+
+/*
+ * A mam-fetch-older page (newest first, as the API returns it): shown
+ * oldest first through the usual path, as PURPLE_MESSAGE_DELAYED with
+ * "mam" = "1" and "mam-query" = "older", then
+ * mam-query-done(account, conv_name, first_id, last_id, complete) on the
+ * plugin. first_id is the oldest message (the next page's before_id);
+ * complete says there is nothing older. A failed request ends the query
+ * with no ids.
+ */
+static void
+discord_native_older_cb(DiscordAccount *da, JsonNode *node, gpointer user_data)
+{
+	DiscordOlderQuery *query = user_data;
+	JsonArray *messages = (node != NULL && JSON_NODE_HOLDS_ARRAY(node)) ? json_node_get_array(node) : NULL;
+	guint len = messages ? json_array_get_length(messages) : 0;
+	const gchar *first_id = NULL, *last_id = NULL;
+	gint i;
+
+	if (len > 0) {
+		first_id = json_object_get_string_member(json_array_get_object_element(messages, len - 1), "id");
+		last_id = json_object_get_string_member(json_array_get_object_element(messages, 0), "id");
+		da->history_older = TRUE;
+
+		for (i = len - 1; i >= 0; i--) {
+			discord_process_message(da, json_array_get_object_element(messages, i), DISCORD_MESSAGE_NORMAL);
+		}
+
+		da->history_older = FALSE;
+	}
+
+	purple_debug_info("discord", "Scroll-back page for %s: %u messages\n", query->conv_name, len);
+
+	if (discord_plugin_handle != NULL) {
+		purple_signal_emit(discord_plugin_handle, "mam-query-done", query->account, query->conv_name,
+		                   first_id, last_id, (guint) (messages != NULL && len < query->count));
+	}
+
+	g_free(query->conv_name);
+	g_free(query);
+}
+
+/*
+ * gboolean mam-fetch-older(PurpleAccount *, const char *conv_name, const char *before_id, guint count)
+ *
+ * Scroll-back: fetches up to @count (1-100) messages before @before_id
+ * (NULL or "": the newest ones) in the conversation's channel (a guild
+ * channel, DM or group DM) with GET /channels/{id}/messages, and shows them
+ * as discord_native_older_cb() describes.
+ */
+static gboolean
+discord_ipc_mam_fetch_older(PurpleAccount *account, const gchar *conv_name, const gchar *before_id, guint count)
+{
+	DiscordAccount *da = discord_ipc_account(account);
+	DiscordOlderQuery *query;
+	guint64 room_id, before = 0;
+	gchar *url;
+
+	if (da == NULL || discord_plugin_handle == NULL || (room_id = discord_ipc_room(da, conv_name, NULL)) == 0) {
+		return FALSE;
+	}
+
+	if (before_id != NULL && *before_id != '\0' && (before = to_int(before_id)) == 0) {
+		return FALSE;
+	}
+
+	count = CLAMP(count, 1, 100);
+	query = g_new0(DiscordOlderQuery, 1);
+	query->account = account;
+	query->conv_name = g_strdup(conv_name);
+	query->count = count;
+
+	if (before != 0) {
+		url = g_strdup_printf("https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/channels/%" G_GUINT64_FORMAT "/messages?limit=%u&before=%" G_GUINT64_FORMAT, room_id, count, before);
+	} else {
+		url = g_strdup_printf("https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/channels/%" G_GUINT64_FORMAT "/messages?limit=%u", room_id, count);
+	}
+
+	discord_fetch_url(da, url, NULL, discord_native_older_cb, query);
+	g_free(url);
+	return TRUE;
+}
+
 /*
  * gboolean send-marker(PurpleAccount *, const char *conv_name, const char *message_id, const char *marker)
  *
@@ -13123,8 +13226,35 @@ discord_ipc_register(PurplePlugin *plugin)
 			purple_value_new(PURPLE_TYPE_STRING),
 			purple_value_new(PURPLE_TYPE_STRING));
 
+	purple_plugin_ipc_register(plugin, "mam-fetch-older",
+			PURPLE_CALLBACK(discord_ipc_mam_fetch_older),
+			purple_marshal_BOOLEAN__POINTER_POINTER_POINTER_UINT,
+			purple_value_new(PURPLE_TYPE_BOOLEAN), 4,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_UINT));
+
 	purple_debug_info("discord", "Registered IPC commands send-correction, send-reaction, "
-	                  "send-retraction, send-reply and send-marker\n");
+	                  "send-retraction, send-reply, send-marker and mam-fetch-older\n");
+
+	/* The end of a scroll-back page; only a message-meta UI listens */
+	{
+		GHashTable *ui_info = purple_core_get_ui_info();
+
+		if (ui_info != NULL && purple_strequal(g_hash_table_lookup(ui_info, "message-meta"), "1")) {
+			purple_signal_register(plugin, "mam-query-done",
+					purple_marshal_VOID__POINTER_POINTER_POINTER_POINTER_UINT,
+					NULL, 5,
+					purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+					purple_value_new(PURPLE_TYPE_STRING),
+					purple_value_new(PURPLE_TYPE_STRING),
+					purple_value_new(PURPLE_TYPE_STRING),
+					purple_value_new(PURPLE_TYPE_BOOLEAN));
+			discord_plugin_handle = plugin;
+			purple_debug_info("discord", "Registered signal mam-query-done\n");
+		}
+	}
 }
 
 // Normally set in core.c in purple3
@@ -13151,6 +13281,10 @@ libpurple2_plugin_unload(PurplePlugin *plugin)
 	_purple_socket_uninit();
 	purple_http_uninit();
 	purple_plugin_ipc_unregister_all(plugin);
+	if (discord_plugin_handle != NULL) {
+		purple_signal_unregister(plugin, "mam-query-done");
+		discord_plugin_handle = NULL;
+	}
 
 	return plugin_unload(plugin, NULL);
 }
