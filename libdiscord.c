@@ -75,6 +75,7 @@
 #define DISCORD_GATEWAY_SERVER_PATH "/?encoding=json&v=10"
 #define DISCORD_API_VERSION "v10"
 #define DISCORD_CDN_SERVER "cdn.discordapp.com"
+#define DISCORD_MEDIA_SERVER "media.discordapp.net"
 
 #ifdef USE_QRCODE_AUTH
 #define DISCORD_QRCODE_AUTH_SERVER "remote-auth-gateway.discord.gg"
@@ -102,6 +103,7 @@
 #define DISCORD_GATEWAY_SERVER_PATH "/?encoding=json&v=1"
 #define DISCORD_API_VERSION "v1"
 #define DISCORD_CDN_SERVER "fluxerstatic.com"
+#define DISCORD_MEDIA_SERVER DISCORD_CDN_SERVER
 
 #undef USE_QRCODE_AUTH
 
@@ -3537,6 +3539,311 @@ discord_append_attachments_html(DiscordAccount *da, const gchar *body, JsonArray
 	return g_string_free(str, FALSE);
 }
 
+/* Sticker format types (sticker_items[].format_type) */
+#define DISCORD_STICKER_PNG    1
+#define DISCORD_STICKER_APNG   2
+#define DISCORD_STICKER_LOTTIE 3
+#define DISCORD_STICKER_GIF    4
+
+/* Stickers as images the UI loads itself. Lottie stickers (vector
+ * animations) have no static image in the API, so they are shown as their
+ * name instead. Returns NULL for none. */
+static gchar *
+discord_native_stickers_html(JsonArray *stickers)
+{
+	GString *str = g_string_new(NULL);
+	guint n, len = stickers ? json_array_get_length(stickers) : 0;
+
+	for (n = 0; n < len; n++) {
+		JsonObject *sticker = json_array_get_object_element(stickers, n);
+		const gchar *sticker_id = json_object_get_string_member(sticker, "id");
+		const gchar *name = json_object_get_string_member(sticker, "name");
+		gint64 format = json_object_get_int_member(sticker, "format_type");
+		gchar *esc_name, *esc_id;
+
+		if (sticker_id == NULL) {
+			continue;
+		}
+
+		if (str->len > 0) {
+			g_string_append(str, "<br/>");
+		}
+
+		esc_name = purple_markup_escape_text(name ? name : _("Sticker"), -1);
+
+		if (format == DISCORD_STICKER_LOTTIE) {
+			g_string_append_printf(str, "[%s]", esc_name);
+		} else {
+			esc_id = purple_markup_escape_text(sticker_id, -1);
+			g_string_append_printf(str,
+				"<img src=\"https://" DISCORD_MEDIA_SERVER "/stickers/%s.%s?size=160\" alt=\"%s\"/>",
+				esc_id, format == DISCORD_STICKER_GIF ? "gif" : "png", esc_name);
+			g_free(esc_id);
+		}
+
+		g_free(esc_name);
+	}
+
+	return g_string_free(str, str->len == 0);
+}
+
+/* The url of an embed's image object ("thumbnail", "image"): Discord's
+ * proxied copy when there is one, so the UI doesn't contact the site */
+static const gchar *
+discord_embed_image_url(JsonObject *embed, const gchar *member)
+{
+	JsonObject *image = json_object_get_object_member(embed, member);
+	const gchar *url;
+
+	if (image == NULL) {
+		return NULL;
+	}
+
+	url = json_object_get_string_member(image, "proxy_url");
+
+	return url ? url : json_object_get_string_member(image, "url");
+}
+
+static gboolean
+discord_url_path_has_suffix(const gchar *url, const gchar *suffix)
+{
+	gchar *path = g_strndup(url, strcspn(url, "?#"));
+	gboolean ret = g_str_has_suffix(path, suffix);
+
+	g_free(path);
+	return ret;
+}
+
+/* The GIF itself for a Tenor or Giphy (gifv) embed, which Discord describes
+ * by an MP4 video and a static thumbnail. NULL if it can't be told. */
+static gchar *
+discord_embed_gif_url(JsonObject *embed)
+{
+	const gchar *image = discord_embed_image_url(embed, "image");
+	JsonObject *video = json_object_get_object_member(embed, "video");
+	const gchar *video_url = video ? json_object_get_string_member(video, "url") : NULL;
+	JsonObject *thumbnail = json_object_get_object_member(embed, "thumbnail");
+	const gchar *thumb_url = thumbnail ? json_object_get_string_member(thumbnail, "url") : NULL;
+
+	if (image != NULL && discord_url_path_has_suffix(image, ".gif")) {
+		return g_strdup(image);
+	}
+
+	if (video_url != NULL && discord_url_path_has_suffix(video_url, ".mp4")) {
+		gchar *path = g_strndup(video_url, strcspn(video_url, "?#"));
+		gchar *ret = NULL;
+
+		if (g_str_has_prefix(path, "https://media.tenor.com/") || g_str_has_prefix(path, "https://c.tenor.com/")) {
+			/* https://media.tenor.com/<id><format>/<slug>.<ext>: format
+			 * AAAPo is the MP4, AAAAC the GIF */
+			gchar *slash = strrchr(path, '/');
+
+			if (slash != NULL && slash - path > 5 && strncmp(slash - 5, "AAAPo", 5) == 0) {
+				memcpy(slash - 5, "AAAAC", 5);
+				path[strlen(path) - 4] = '\0';
+				ret = g_strconcat(path, ".gif", NULL);
+			}
+		} else if (g_str_has_prefix(path, "https://media.giphy.com/media/") ||
+		           g_str_has_prefix(path, "https://i.giphy.com/")) {
+			path[strlen(path) - 4] = '\0';
+			ret = g_strconcat(path, ".gif", NULL);
+		}
+
+		g_free(path);
+
+		if (ret != NULL) {
+			return ret;
+		}
+	}
+
+	if (thumb_url != NULL && discord_url_path_has_suffix(thumb_url, ".gif")) {
+		return g_strdup(thumb_url);
+	}
+
+	return NULL;
+}
+
+/* The image an embed shows, if any: the GIF for gifv embeds, else the
+ * large image, else the thumbnail */
+static gchar *
+discord_embed_main_image(JsonObject *embed)
+{
+	const gchar *type = json_object_get_string_member(embed, "type");
+	const gchar *url;
+
+	if (purple_strequal(type, "gifv")) {
+		gchar *gif = discord_embed_gif_url(embed);
+
+		if (gif != NULL) {
+			return gif;
+		}
+	}
+
+	url = discord_embed_image_url(embed, "image");
+
+	if (url == NULL) {
+		url = discord_embed_image_url(embed, "thumbnail");
+	}
+
+	return g_strdup(url);
+}
+
+#define DISCORD_EMBED_DESCRIPTION_MAX 200
+
+/*
+ * One embed as a compact block the UI's renderer shows. A GIF (gifv) or a
+ * bare image link is just the image; anything else is
+ *   <b><a href=url>title</a></b><br/>description (at most ~200
+ *   characters)<br/>fields (rich embeds)<br/><img src=image>
+ * NULL if the embed has nothing to show.
+ */
+static gchar *
+discord_native_embed_html(JsonObject *embed)
+{
+	const gchar *type = json_object_get_string_member(embed, "type");
+	const gchar *title = json_object_get_string_member(embed, "title");
+	const gchar *url = json_object_get_string_member(embed, "url");
+	const gchar *description = json_object_get_string_member(embed, "description");
+	JsonObject *author = json_object_get_object_member(embed, "author");
+	JsonArray *fields = json_object_get_array_member(embed, "fields");
+	gchar *image = discord_embed_main_image(embed);
+	GString *str = g_string_new(NULL);
+	gchar *esc, *tmp;
+
+	if (!purple_strequal(type, "gifv") && !purple_strequal(type, "image")) {
+		if (title == NULL && author != NULL) {
+			title = json_object_get_string_member(author, "name");
+		}
+
+		if (title != NULL && *title) {
+			g_string_append(str, "<b>");
+
+			if (url != NULL) {
+				esc = purple_markup_escape_text(url, -1);
+				g_string_append_printf(str, "<a href=\"%s\">", esc);
+				g_free(esc);
+			}
+
+			esc = purple_markup_escape_text(title, -1);
+			g_string_append(str, esc);
+			g_free(esc);
+
+			if (url != NULL) {
+				g_string_append(str, "</a>");
+			}
+
+			g_string_append(str, "</b>");
+		}
+
+		if (description != NULL && *description) {
+			gchar *cut = discord_meta_preview(description, DISCORD_EMBED_DESCRIPTION_MAX);
+
+			if (cut != NULL) {
+				if (str->len > 0) {
+					g_string_append(str, "<br/>");
+				}
+
+				tmp = discord_embed_markdown(cut);
+				g_string_append(str, tmp);
+				g_free(tmp);
+				g_free(cut);
+			}
+		}
+
+		if (fields != NULL) {
+			guint j, fields_len = json_array_get_length(fields);
+
+			for (j = 0; j < fields_len; j++) {
+				JsonObject *field = json_array_get_object_element(fields, j);
+				const gchar *name = json_object_get_string_member(field, "name");
+				const gchar *value = json_object_get_string_member(field, "value");
+
+				if (str->len > 0) {
+					g_string_append(str, "<br/>");
+				}
+
+				if (name != NULL) {
+					tmp = discord_embed_markdown(name);
+					g_string_append_printf(str, "<b>%s</b> ", tmp);
+					g_free(tmp);
+				}
+
+				if (value != NULL) {
+					tmp = discord_embed_markdown(value);
+					g_string_append(str, tmp);
+					g_free(tmp);
+				}
+			}
+		}
+	}
+
+	if (image != NULL) {
+		if (str->len > 0) {
+			g_string_append(str, "<br/>");
+		}
+
+		esc = purple_markup_escape_text(image, -1);
+		g_string_append_printf(str, "<img src=\"%s\" alt=\"%s\"/>", esc,
+		                       purple_strequal(type, "gifv") ? "GIF" : _("Image"));
+		g_free(esc);
+		g_free(image);
+	}
+
+	return g_string_free(str, str->len == 0);
+}
+
+/* @body with the stickers and each embed's block appended, one per line */
+static gchar *
+discord_native_append_extras(const gchar *body, JsonArray *stickers, JsonArray *embeds)
+{
+	GString *str = g_string_new(body ? body : "");
+	gchar *html = discord_native_stickers_html(stickers);
+	guint n = 0, len = embeds ? json_array_get_length(embeds) : 0;
+
+	for (;;) {
+		if (html != NULL) {
+			if (str->len > 0) {
+				g_string_append(str, "<br/>");
+			}
+
+			g_string_append(str, html);
+			g_free(html);
+			html = NULL;
+		}
+
+		if (n >= len) {
+			break;
+		}
+
+		html = discord_native_embed_html(json_array_get_object_element(embeds, n++));
+	}
+
+	return g_string_free(str, FALSE);
+}
+
+/* The first embed's raw fields, for a UI that draws a card: embed-type,
+ * embed-title, embed-description, embed-url and embed-image */
+static void
+discord_meta_set_embed(GHashTable *meta, JsonObject *data)
+{
+	JsonArray *embeds = json_object_get_array_member(data, "embeds");
+	JsonObject *embed;
+	gchar *image;
+
+	if (embeds == NULL || json_array_get_length(embeds) == 0 ||
+	    (embed = json_array_get_object_element(embeds, 0)) == NULL) {
+		return;
+	}
+
+	discord_meta_set(meta, "embed-type", json_object_get_string_member(embed, "type"));
+	discord_meta_set(meta, "embed-title", json_object_get_string_member(embed, "title"));
+	discord_meta_set(meta, "embed-description", json_object_get_string_member(embed, "description"));
+	discord_meta_set(meta, "embed-url", json_object_get_string_member(embed, "url"));
+	image = discord_embed_main_image(embed);
+	discord_meta_set(meta, "embed-image", image);
+	g_free(image);
+}
+
 /* The name the UI knows @channel_id's conversation by (a thread's parent
  * channel for thread messages), and whether it is a room */
 static gchar *
@@ -3645,6 +3952,8 @@ discord_native_before_write(DiscordAccount *da, JsonObject *data, const gchar *c
 	if (special_type == DISCORD_MESSAGE_EDITED) {
 		discord_meta_set(meta, "correction-of", json_object_get_string_member(data, "id"));
 	}
+
+	discord_meta_set_embed(meta, data);
 
 	if (discord_emit_message_meta(da, conv_name, meta)) {
 		purple_debug_info("discord", "Message %s is shown already\n", json_object_get_string_member(data, "id"));
@@ -3758,11 +4067,25 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 		return msg_id;
 	}
 
+	/* An update that isn't an edit: link embeds arriving (native_meta) */
+	gboolean embed_only = FALSE;
+
 	if (edited && da->native_meta && json_object_get_string_member(data, "edited_timestamp") == NULL) {
-		/* An update that isn't an edit (link embeds arriving): the UI
-		 * would show it as a correction of an unchanged message */
-		purple_debug_info("discord", "Ignoring a message update without an edit\n");
-		return msg_id;
+		JsonArray *update_embeds = json_object_get_array_member(data, "embeds");
+		guint n, update_embeds_len = update_embeds ? json_array_get_length(update_embeds) : 0;
+
+		for (n = 0; n < update_embeds_len && !embed_only; n++) {
+			gchar *html = discord_native_embed_html(json_array_get_object_element(update_embeds, n));
+
+			embed_only = html != NULL;
+			g_free(html);
+		}
+
+		if (!embed_only) {
+			/* Nothing the UI would show differently */
+			purple_debug_info("discord", "Ignoring a message update without an edit\n");
+			return msg_id;
+		}
 	}
 
 	JsonObject *author_obj = json_object_get_object_member(data, "author");
@@ -3950,6 +4273,15 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 			tmp = NULL;
 		}
 		g_free(thread_ts);
+	}
+
+	if (da->native_meta) {
+		/* Images the UI loads itself, and compact embed blocks */
+		tmp = discord_native_append_extras(escaped_content, stickers, embeds);
+		g_free(escaped_content);
+		escaped_content = tmp;
+		stickers = NULL;
+		embeds = NULL;
 	}
 
 	if (stickers != NULL) {
@@ -4154,11 +4486,28 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 
 		if (edited) {
 			gchar *conv_name = native_is_chat ? g_strdup(channel_id_s) : g_strdup(g_hash_table_lookup(da->one_to_ones, channel_id_s));
-			gboolean handled = discord_emit_corrected(da, conv_name, msg_id_s, escaped_content, native_sender);
+			gboolean handled;
+
+			if (embed_only) {
+				/* Describes the correction that follows: the UI may show it
+				 * without an "edited" mark */
+				GHashTable *meta = discord_meta_new();
+
+				discord_meta_set(meta, "conv-type", native_is_chat ? "chat" : "im");
+				discord_meta_set(meta, "sender", native_sender);
+				discord_meta_set(meta, "correction-of", msg_id_s);
+				discord_meta_set(meta, "embed-only-update", "1");
+				discord_meta_set_embed(meta, data);
+				discord_emit_message_meta(da, conv_name, meta);
+			}
+
+			handled = discord_emit_corrected(da, conv_name, msg_id_s, escaped_content, native_sender);
 
 			g_free(conv_name);
 
-			if (handled) {
+			if (handled || embed_only) {
+				/* An embed-only update of a message the UI doesn't show:
+				 * nothing, rather than an EDIT: line of unchanged text */
 				g_free(native_sender);
 				g_free(native_reply_sender);
 				g_free(escaped_content);
