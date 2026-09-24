@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+	<maintainer type="person">
+		<email>lenara@minowick.com</email>
+		<name>Lenara Fetton</name>
+	</maintainer>
+	<use>
+		<flag name="qrcode">Support logging in by scanning a QR code with the Discord mobile app (<pkg>media-gfx/qrencode</pkg>)</flag>
+	</use>
+	<upstream>
+		<remote-id type="github">lenara-fetton/purple-discord</remote-id>
+	</upstream>
+</pkgmetadata>

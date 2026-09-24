@@ -75,6 +75,7 @@
 #define DISCORD_GATEWAY_SERVER_PATH "/?encoding=json&v=10"
 #define DISCORD_API_VERSION "v10"
 #define DISCORD_CDN_SERVER "cdn.discordapp.com"
+#define DISCORD_MEDIA_SERVER "media.discordapp.net"
 
 #ifdef USE_QRCODE_AUTH
 #define DISCORD_QRCODE_AUTH_SERVER "remote-auth-gateway.discord.gg"
@@ -102,6 +103,7 @@
 #define DISCORD_GATEWAY_SERVER_PATH "/?encoding=json&v=1"
 #define DISCORD_API_VERSION "v1"
 #define DISCORD_CDN_SERVER "fluxerstatic.com"
+#define DISCORD_MEDIA_SERVER DISCORD_CDN_SERVER
 
 #undef USE_QRCODE_AUTH
 
@@ -114,6 +116,9 @@
 #define DISCORD_MESSAGE_NORMAL (0)
 #define DISCORD_MESSAGE_EDITED (1)
 #define DISCORD_MESSAGE_PINNED (2)
+/* An existing message shown again for context (a thread start): like NORMAL,
+ * except that native metadata doesn't treat it as the message itself */
+#define DISCORD_MESSAGE_CONTEXT (3)
 
 #define DISCORD_GUILD_SIZE_DEFAULT (0)
 #define DISCORD_GUILD_SIZE_LARGE (1)
@@ -443,7 +448,33 @@ typedef struct {
 	gboolean running_auth_qrcode;
 #endif
 
+	/* Native message metadata (the UI's ui_info has "message-meta" = "1",
+	 * e.g. pidgin4). Everything below is only used when it is TRUE; on a
+	 * stock UI the plugin's output is unchanged. */
+	gboolean native_meta;
+	GHashTable *deferred_echo;      /* nonces of our own sends, shown when the server echoes them */
+	GHashTable *msg_info;           /* message id -> DiscordMsgInfo (bounded) */
+	GQueue *msg_info_order;         /* insertion order of msg_info keys */
+	GHashTable *own_reactions;      /* message id -> set of API emoji ("name" or "name:id") (bounded) */
+	GQueue *own_reactions_order;
+	GHashTable *custom_emoji;       /* custom emoji name -> id, as seen in messages and reactions */
+	GHashTable *read_acked;         /* channel id -> newest message id read (acked by us or another client) */
+	gboolean history_older;         /* processing a mam-fetch-older page */
+	GQueue *reaction_msgs;          /* DiscordReactionMsg: history messages whose reactors to fetch */
+	guint reaction_timer;           /* the next reactors request */
+	gboolean reaction_busy;         /* a reactors request is out */
+	gint reaction_rl_remaining;     /* X-RateLimit-Remaining of the last reactors request, -1: unknown */
+	gdouble reaction_rl_reset_after;        /* X-RateLimit-Reset-After of it, seconds */
+
 } DiscordAccount;
+
+/* What the plugin remembers about a message it showed (native_meta only) */
+typedef struct {
+	guint64 channel_id;     /* the real channel: a thread's own id for thread messages */
+	gchar *sender;          /* as passed to the UI: nick in rooms, username in IMs */
+} DiscordMsgInfo;
+
+#define DISCORD_META_CACHE_SIZE 4096
 
 #ifdef USE_QRCODE_AUTH
 #	include "discord_rsa.c"
@@ -1634,6 +1665,19 @@ discord_cookies_to_string(DiscordAccount *ya)
 
 static void discord_fetch_url_with_method_delay_len(DiscordAccount *da, const gchar *method, const gchar *url, const gchar *postdata, gsize postdata_len, DiscordProxyCallbackFunc callback, gpointer user_data, guint delay);
 
+/* The rate limit state of the reactors endpoint (native_meta): its
+ * X-RateLimit-Remaining and X-RateLimit-Reset-After headers */
+static void
+discord_native_note_rate_limit(DiscordAccount *da, const gchar *remaining, const gchar *reset_after)
+{
+	da->reaction_rl_remaining = remaining ? (gint) g_ascii_strtoll(remaining, NULL, 10) : -1;
+	da->reaction_rl_reset_after = reset_after ? g_ascii_strtod(reset_after, NULL) : 0;
+
+	if (da->reaction_rl_reset_after < 0 || da->reaction_rl_reset_after > 600) {
+		da->reaction_rl_reset_after = 5;
+	}
+}
+
 static void
 discord_response_callback(PurpleHttpConnection *http_conn,
 							PurpleHttpResponse *response, gpointer user_data)
@@ -1650,6 +1694,12 @@ discord_response_callback(PurpleHttpConnection *http_conn,
 
 	discord_update_cookies(conn->ya, purple_http_response_get_headers_by_name(response, "Set-Cookie"));
 	int response_code = purple_http_response_get_code(response);
+
+	if (conn->ya->native_meta && request_url != NULL && strstr(request_url, "/reactions/") != NULL) {
+		discord_native_note_rate_limit(conn->ya,
+			purple_http_response_get_header(response, "X-RateLimit-Remaining"),
+			purple_http_response_get_header(response, "X-RateLimit-Reset-After"));
+	}
 
 	if (response_code == 429 && request != NULL) {
 		gdouble retry_after = 5;
@@ -3004,6 +3054,1319 @@ discord_embed_markdown(const gchar *text)
 	return ret;
 }
 
+/*
+ * Native message metadata, for UIs that render replies, edits, reactions
+ * and deletes themselves (pidgin4). The UI says so by putting
+ * "message-meta" = "1" into purple_core_get_ui_info(); only then does the
+ * plugin emit the conversation signals below, which such a UI registers:
+ *
+ *   receiving-message-meta (account, conv name, GHashTable *meta)
+ *   message-corrected      (account, conv name, target id, new id, new body, sender)
+ *   message-reaction       (account, conv name, target id, emoji, sender, add)
+ *   message-retracted      (account, conv name, target id, sender, reason)
+ *
+ * The last three return TRUE when the UI rendered the event; otherwise the
+ * plugin writes its usual text line. On every other UI (stock Pidgin 2) none
+ * of this runs and the output is exactly what it always was.
+ *
+ * Meta keys: conv-type (im/chat), sender, timestamp (unix seconds),
+ * stanza-id and server-id (both the message's snowflake: Discord ids are
+ * assigned by the server and unique, so the UI dedups history replays on
+ * them), reply-to, reply-to-sender, reply-to-text (a plain preview of the
+ * replied-to message), outgoing (own message sent from another client) and,
+ * for an edit shown as a new line, correction-of.
+ *
+ * Reaction emoji are passed as the Unicode emoji, or ":name:" for custom
+ * emoji (their ids are remembered to map them back when reacting).
+ */
+
+static void
+discord_msg_info_free(gpointer data)
+{
+	DiscordMsgInfo *info = data;
+
+	if (info != NULL) {
+		g_free(info->sender);
+		g_free(info);
+	}
+}
+
+/* A history message whose reactors are still to be fetched (native_meta) */
+typedef struct {
+	guint64 channel_id;     /* the message's own channel (a thread's for thread messages) */
+	gchar *msg_id;
+	GQueue emojis;          /* DiscordReactionEmoji */
+} DiscordReactionMsg;
+
+typedef struct {
+	gchar *api;             /* "name" or "name:id", for the endpoint */
+	gchar *display;         /* the UI's form: the emoji, or ":name:" */
+} DiscordReactionEmoji;
+
+static void
+discord_reaction_emoji_free(gpointer data)
+{
+	DiscordReactionEmoji *emoji = data;
+
+	g_free(emoji->api);
+	g_free(emoji->display);
+	g_free(emoji);
+}
+
+static void
+discord_reaction_msg_free(gpointer data)
+{
+	DiscordReactionMsg *msg = data;
+
+	g_free(msg->msg_id);
+	g_queue_clear_full(&msg->emojis, discord_reaction_emoji_free);
+	g_free(msg);
+}
+
+static void
+discord_native_init(DiscordAccount *da)
+{
+	GHashTable *ui_info = purple_core_get_ui_info();
+
+	da->native_meta = ui_info != NULL &&
+		purple_strequal(g_hash_table_lookup(ui_info, "message-meta"), "1");
+
+	if (!da->native_meta) {
+		return;
+	}
+
+	da->deferred_echo = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	da->msg_info = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, discord_msg_info_free);
+	da->msg_info_order = g_queue_new();
+	da->own_reactions = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify) g_hash_table_unref);
+	da->own_reactions_order = g_queue_new();
+	da->custom_emoji = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	da->read_acked = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
+	da->reaction_msgs = g_queue_new();
+	da->reaction_rl_remaining = -1;
+
+	purple_debug_info("discord", "UI supports message-meta: native replies, edits, reactions and deletes\n");
+}
+
+static void
+discord_native_free(DiscordAccount *da)
+{
+	if (!da->native_meta) {
+		return;
+	}
+
+	g_hash_table_destroy(da->deferred_echo);
+	g_hash_table_destroy(da->msg_info);
+	g_queue_free_full(da->msg_info_order, g_free);
+	g_hash_table_destroy(da->own_reactions);
+	g_queue_free_full(da->own_reactions_order, g_free);
+	g_hash_table_destroy(da->custom_emoji);
+	g_hash_table_destroy(da->read_acked);
+	da->read_acked = NULL;
+
+	if (da->reaction_timer) {
+		purple_timeout_remove(da->reaction_timer);
+		da->reaction_timer = 0;
+	}
+
+	g_queue_free_full(da->reaction_msgs, discord_reaction_msg_free);
+	da->reaction_msgs = NULL;
+	da->deferred_echo = da->msg_info = da->own_reactions = da->custom_emoji = NULL;
+	da->msg_info_order = da->own_reactions_order = NULL;
+	da->native_meta = FALSE;
+}
+
+/* Inserts into a table whose size is bounded by dropping the oldest keys */
+static void
+discord_bounded_insert(GHashTable *table, GQueue *order, const gchar *key, gpointer value)
+{
+	if (!g_hash_table_contains(table, key)) {
+		g_queue_push_tail(order, g_strdup(key));
+
+		while (g_queue_get_length(order) > DISCORD_META_CACHE_SIZE) {
+			gchar *old = g_queue_pop_head(order);
+
+			g_hash_table_remove(table, old);
+			g_free(old);
+		}
+	}
+
+	g_hash_table_replace(table, g_strdup(key), value);
+}
+
+static void
+discord_remember_message(DiscordAccount *da, const gchar *msg_id, guint64 channel_id, const gchar *sender)
+{
+	DiscordMsgInfo *info;
+
+	if (!da->native_meta || msg_id == NULL || *msg_id == '\0') {
+		return;
+	}
+
+	info = g_new0(DiscordMsgInfo, 1);
+	info->channel_id = channel_id;
+	info->sender = g_strdup(sender);
+	discord_bounded_insert(da->msg_info, da->msg_info_order, msg_id, info);
+}
+
+static GHashTable *
+discord_meta_new(void)
+{
+	return g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+}
+
+static void
+discord_meta_set(GHashTable *meta, const gchar *key, const gchar *value)
+{
+	if (value != NULL) {
+		g_hash_table_replace(meta, g_strdup(key), g_strdup(value));
+	}
+}
+
+/* The first @max characters of @text, plain */
+static gchar *
+discord_meta_preview(const gchar *text, glong max)
+{
+	gchar *ret;
+
+	if (text == NULL || *text == '\0') {
+		return NULL;
+	}
+
+	if (!g_utf8_validate(text, -1, NULL)) {
+		return NULL;
+	}
+
+	if (g_utf8_strlen(text, -1) <= max) {
+		return g_strdup(text);
+	}
+
+	ret = g_malloc(g_utf8_offset_to_pointer(text, max) - text + 4);
+	g_utf8_strncpy(ret, text, max);
+	strcat(ret, "…");
+	return ret;
+}
+
+/*
+ * The receiving-message-meta table for a message object (MESSAGE_CREATE,
+ * a history entry or a REST reply). @with_ids is FALSE for edits and pins
+ * shown as a new line: they carry the message's own id, and the UI would
+ * drop them as duplicates.
+ */
+static GHashTable *
+discord_message_meta_build(JsonObject *data, gboolean is_chat, const gchar *sender,
+                           gboolean outgoing, gboolean with_ids, const gchar *reply_sender)
+{
+	GHashTable *meta = discord_meta_new();
+	const gchar *id = json_object_get_string_member(data, "id");
+	const gchar *timestamp_str = json_object_get_string_member(data, "timestamp");
+	JsonObject *referenced = json_object_get_object_member(data, "referenced_message");
+	const gchar *reply_to = NULL;
+
+	discord_meta_set(meta, "conv-type", is_chat ? "chat" : "im");
+	discord_meta_set(meta, "sender", sender);
+
+	if (outgoing) {
+		discord_meta_set(meta, "outgoing", "1");
+	}
+
+	if (timestamp_str != NULL) {
+		time_t ts = discord_str_to_time(timestamp_str);
+
+		if (ts > 0) {
+			gchar *ts_s = g_strdup_printf("%" G_GINT64_FORMAT, (gint64) ts);
+
+			discord_meta_set(meta, "timestamp", ts_s);
+			g_free(ts_s);
+		}
+	}
+
+	if (with_ids && id != NULL && *id != '\0') {
+		discord_meta_set(meta, "stanza-id", id);
+		discord_meta_set(meta, "server-id", id);
+	}
+
+	if (referenced != NULL) {
+		reply_to = json_object_get_string_member(referenced, "id");
+	}
+
+	if (reply_to == NULL && json_object_get_int_member(data, "type") == MESSAGE_REPLY) {
+		/* The replied-to message was deleted: only the reference is left */
+		JsonObject *reference = json_object_get_object_member(data, "message_reference");
+
+		reply_to = json_object_get_string_member(reference, "message_id");
+	}
+
+	if (reply_to != NULL && *reply_to != '\0') {
+		discord_meta_set(meta, "reply-to", reply_to);
+		discord_meta_set(meta, "reply-to-sender", reply_sender);
+
+		if (referenced != NULL) {
+			gchar *preview = discord_meta_preview(json_object_get_string_member(referenced, "content"), 200);
+
+			discord_meta_set(meta, "reply-to-text", preview);
+			g_free(preview);
+		}
+	}
+
+	return meta;
+}
+
+/*
+ * Emits receiving-message-meta for the write that follows. Returns TRUE if
+ * the UI asked for the message to be dropped (it has it already: a history
+ * fetch or a replayed gateway event). Takes @meta.
+ */
+static gboolean
+discord_emit_message_meta(DiscordAccount *da, const gchar *conv_name, GHashTable *meta)
+{
+	gboolean discard;
+
+	purple_signal_emit(purple_conversations_get_handle(), "receiving-message-meta",
+	                   da->account, conv_name, meta);
+	discard = purple_strequal(g_hash_table_lookup(meta, "discard"), "1");
+	g_hash_table_unref(meta);
+
+	return discard;
+}
+
+static gboolean
+discord_emit_corrected(DiscordAccount *da, const gchar *conv_name, const gchar *msg_id,
+                       const gchar *new_body, const gchar *sender)
+{
+	/* Discord edits keep the message id: target and new id are the same */
+	return GPOINTER_TO_INT(purple_signal_emit_return_1(purple_conversations_get_handle(),
+		"message-corrected", da->account, conv_name, msg_id, msg_id, new_body, sender));
+}
+
+static gboolean
+discord_emit_reaction(DiscordAccount *da, const gchar *conv_name, const gchar *msg_id,
+                      const gchar *emoji, const gchar *sender, gboolean add)
+{
+	return GPOINTER_TO_INT(purple_signal_emit_return_1(purple_conversations_get_handle(),
+		"message-reaction", da->account, conv_name, msg_id, emoji, sender, GINT_TO_POINTER(add)));
+}
+
+static gboolean
+discord_emit_retracted(DiscordAccount *da, const gchar *conv_name, const gchar *msg_id,
+                       const gchar *sender)
+{
+	return GPOINTER_TO_INT(purple_signal_emit_return_1(purple_conversations_get_handle(),
+		"message-retracted", da->account, conv_name, msg_id, sender, NULL));
+}
+
+/* How a reaction emoji is shown to the UI: the emoji itself, or ":name:" */
+static gchar *
+discord_reaction_emoji_display(DiscordAccount *da, JsonObject *emoji)
+{
+	const gchar *name = json_object_get_string_member(emoji, "name");
+	const gchar *id = json_object_get_string_member(emoji, "id");
+
+	if (name == NULL || *name == '\0') {
+		return NULL;
+	}
+
+	if (id != NULL) {
+		if (da != NULL && da->custom_emoji != NULL) {
+			g_hash_table_replace(da->custom_emoji, g_strdup(name), g_strdup(id));
+		}
+
+		return g_strdup_printf(":%s:", name);
+	}
+
+	return g_strdup(name);
+}
+
+/* The form the reactions endpoints take: "name:id" for custom emoji */
+static gchar *
+discord_reaction_emoji_api_from_json(JsonObject *emoji)
+{
+	const gchar *name = json_object_get_string_member(emoji, "name");
+	const gchar *id = json_object_get_string_member(emoji, "id");
+
+	if (name == NULL || *name == '\0') {
+		return NULL;
+	}
+
+	return id ? g_strdup_printf("%s:%s", name, id) : g_strdup(name);
+}
+
+/* The UI's form (see discord_reaction_emoji_display()) to the API's; NULL for
+ * a custom emoji whose id isn't known */
+static gchar *
+discord_reaction_emoji_to_api(DiscordAccount *da, DiscordGuild *guild, const gchar *display)
+{
+	gsize len;
+
+	if (display == NULL || *display == '\0') {
+		return NULL;
+	}
+
+	len = strlen(display);
+
+	if (len > 2 && display[0] == ':' && display[len - 1] == ':') {
+		gchar *name = g_strndup(display + 1, len - 2);
+		const gchar *id = NULL;
+		gchar *ret = NULL;
+
+		if (guild != NULL && guild->emojis != NULL) {
+			id = g_hash_table_lookup(guild->emojis, name);
+		}
+
+		if (id == NULL && da != NULL && da->custom_emoji != NULL) {
+			id = g_hash_table_lookup(da->custom_emoji, name);
+		}
+
+		if (id != NULL) {
+			ret = g_strdup_printf("%s:%s", name, id);
+		}
+
+		g_free(name);
+		return ret;
+	}
+
+	return g_strdup(display);
+}
+
+/* Our own reactions on a message, in API form; NULL if none are known */
+static GHashTable *
+discord_own_reactions_get(DiscordAccount *da, const gchar *msg_id, gboolean create)
+{
+	GHashTable *set = g_hash_table_lookup(da->own_reactions, msg_id);
+
+	if (set == NULL && create) {
+		set = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+		discord_bounded_insert(da->own_reactions, da->own_reactions_order, msg_id, set);
+	}
+
+	return set;
+}
+
+static void
+discord_own_reactions_update(DiscordAccount *da, const gchar *msg_id, const gchar *api_emoji, gboolean add)
+{
+	GHashTable *set;
+
+	if (!da->native_meta || msg_id == NULL || api_emoji == NULL) {
+		return;
+	}
+
+	set = discord_own_reactions_get(da, msg_id, add);
+
+	if (set == NULL) {
+		return;
+	}
+
+	if (add) {
+		g_hash_table_add(set, g_strdup(api_emoji));
+	} else {
+		g_hash_table_remove(set, api_emoji);
+	}
+}
+
+/*
+ * The UI sends the complete new set of our reactions; Discord adds and
+ * removes one at a time. @current is what we know we have (may be NULL),
+ * @wanted the new set in API form.
+ */
+static void
+discord_reaction_diff(GHashTable *current, GPtrArray *wanted, GPtrArray *to_add, GPtrArray *to_remove)
+{
+	GHashTableIter iter;
+	gpointer key;
+	guint i;
+
+	for (i = 0; i < wanted->len; i++) {
+		const gchar *emoji = g_ptr_array_index(wanted, i);
+		gboolean dup = FALSE;
+		guint j;
+
+		for (j = 0; j < i; j++) {
+			dup = dup || purple_strequal(g_ptr_array_index(wanted, j), emoji);
+		}
+
+		if (!dup && (current == NULL || !g_hash_table_contains(current, emoji))) {
+			g_ptr_array_add(to_add, g_strdup(emoji));
+		}
+	}
+
+	if (current == NULL) {
+		return;
+	}
+
+	g_hash_table_iter_init(&iter, current);
+
+	while (g_hash_table_iter_next(&iter, &key, NULL)) {
+		gboolean keep = FALSE;
+
+		for (i = 0; i < wanted->len && !keep; i++) {
+			keep = purple_strequal(g_ptr_array_index(wanted, i), key);
+		}
+
+		if (!keep) {
+			g_ptr_array_add(to_remove, g_strdup(key));
+		}
+	}
+}
+
+/* Custom emoji as a remote image the UI loads itself (no imgstore download) */
+static gboolean
+discord_replace_emoji_native(const GMatchInfo *match, GString *result, gpointer user_data)
+{
+	DiscordAccount *da = user_data;
+	gchar *all = g_match_info_fetch(match, 0);
+	gchar *alt_text = g_match_info_fetch(match, 1);
+	gchar *emoji_id = g_match_info_fetch(match, 2);
+	gboolean animated = g_str_has_prefix(all, "&lt;a:");
+
+	if (da != NULL && da->custom_emoji != NULL) {
+		/* alt_text is HTML-escaped; names are [A-Za-z0-9_] anyway */
+		g_hash_table_replace(da->custom_emoji, g_strdup(alt_text), g_strdup(emoji_id));
+	}
+
+	g_string_append_printf(result,
+		"<img src=\"https://" DISCORD_CDN_SERVER "/emojis/%s.%s?size=48\" alt=\":%s:\" width=\"22\" height=\"22\"/>",
+		emoji_id, animated ? "gif" : "png", alt_text);
+
+	g_free(all);
+	g_free(emoji_id);
+	g_free(alt_text);
+
+	return FALSE;
+}
+
+/* One attachment as HTML for the UI's image loader (no imgstore download) */
+static gchar *
+discord_attachment_html(DiscordAccount *da, JsonObject *attachment)
+{
+	const gchar *url = json_object_get_string_member(attachment, "url");
+	const gchar *proxy_url = json_object_get_string_member(attachment, "proxy_url");
+	const gchar *type = json_object_get_string_member(attachment, "content_type");
+	const gchar *filename = json_object_get_string_member(attachment, "filename");
+	gchar *esc_url, *esc_name, *ret;
+
+	if (url == NULL) {
+		url = proxy_url;
+	}
+
+	if (url == NULL) {
+		return NULL;
+	}
+
+	esc_url = purple_markup_escape_text(url, -1);
+
+	if (proxy_url == NULL || type == NULL || !g_str_has_prefix(type, "image") ||
+	    strstr(proxy_url, "/SPOILER_") != NULL || strstr(url, "/SPOILER_") != NULL) {
+		/* Spoilers and other files stay links, as before */
+		return esc_url;
+	}
+
+	gint image_size = da ? purple_account_get_int(da->account, "image-size", 0) : 0;
+	gint64 width = json_object_get_int_member(attachment, "width");
+	gint64 height = json_object_get_int_member(attachment, "height");
+	gchar *sized_url;
+
+	if (image_size > 0 && image_size < width) {
+		gdouble factor = (gdouble) image_size / (gdouble) width;
+
+		sized_url = g_strdup_printf("%s%swidth=%u&height=%u", proxy_url, strchr(proxy_url, '?') ? "&" : "?",
+		                            (guint) ((gdouble) width * factor), (guint) ((gdouble) height * factor));
+	} else {
+		sized_url = g_strdup(proxy_url);
+	}
+
+	gchar *esc_sized = purple_markup_escape_text(sized_url, -1);
+
+	esc_name = purple_markup_escape_text(filename ? filename : url, -1);
+	ret = g_strdup_printf("<a href=\"%s\">%s</a><br/><img src=\"%s\" alt=\"%s\"/>", esc_url, esc_name, esc_sized, esc_name);
+
+	g_free(esc_sized);
+	g_free(sized_url);
+	g_free(esc_name);
+	g_free(esc_url);
+	return ret;
+}
+
+/* @body with every attachment appended, one per line */
+static gchar *
+discord_append_attachments_html(DiscordAccount *da, const gchar *body, JsonArray *attachments)
+{
+	GString *str = g_string_new(body ? body : "");
+	guint i, len = json_array_get_length(attachments);
+
+	for (i = 0; i < len; i++) {
+		gchar *html = discord_attachment_html(da, json_array_get_object_element(attachments, i));
+
+		if (html != NULL) {
+			if (str->len > 0) {
+				g_string_append(str, "<br/>");
+			}
+
+			g_string_append(str, html);
+			g_free(html);
+		}
+	}
+
+	return g_string_free(str, FALSE);
+}
+
+/* Sticker format types (sticker_items[].format_type) */
+#define DISCORD_STICKER_PNG    1
+#define DISCORD_STICKER_APNG   2
+#define DISCORD_STICKER_LOTTIE 3
+#define DISCORD_STICKER_GIF    4
+
+/* Stickers as images the UI loads itself. Lottie stickers (vector
+ * animations) have no static image in the API, so they are shown as their
+ * name instead. Returns NULL for none. */
+static gchar *
+discord_native_stickers_html(JsonArray *stickers)
+{
+	GString *str = g_string_new(NULL);
+	guint n, len = stickers ? json_array_get_length(stickers) : 0;
+
+	for (n = 0; n < len; n++) {
+		JsonObject *sticker = json_array_get_object_element(stickers, n);
+		const gchar *sticker_id = json_object_get_string_member(sticker, "id");
+		const gchar *name = json_object_get_string_member(sticker, "name");
+		gint64 format = json_object_get_int_member(sticker, "format_type");
+		gchar *esc_name, *esc_id;
+
+		if (sticker_id == NULL) {
+			continue;
+		}
+
+		if (str->len > 0) {
+			g_string_append(str, "<br/>");
+		}
+
+		esc_name = purple_markup_escape_text(name ? name : _("Sticker"), -1);
+
+		if (format == DISCORD_STICKER_LOTTIE) {
+			g_string_append_printf(str, "[%s]", esc_name);
+		} else {
+			esc_id = purple_markup_escape_text(sticker_id, -1);
+			g_string_append_printf(str,
+				"<img src=\"https://" DISCORD_MEDIA_SERVER "/stickers/%s.%s?size=160\" alt=\"%s\"/>",
+				esc_id, format == DISCORD_STICKER_GIF ? "gif" : "png", esc_name);
+			g_free(esc_id);
+		}
+
+		g_free(esc_name);
+	}
+
+	return g_string_free(str, str->len == 0);
+}
+
+/* The url of an embed's image object ("thumbnail", "image"): Discord's
+ * proxied copy when there is one, so the UI doesn't contact the site */
+static const gchar *
+discord_embed_image_url(JsonObject *embed, const gchar *member)
+{
+	JsonObject *image = json_object_get_object_member(embed, member);
+	const gchar *url;
+
+	if (image == NULL) {
+		return NULL;
+	}
+
+	url = json_object_get_string_member(image, "proxy_url");
+
+	return url ? url : json_object_get_string_member(image, "url");
+}
+
+static gboolean
+discord_url_path_has_suffix(const gchar *url, const gchar *suffix)
+{
+	gchar *path = g_strndup(url, strcspn(url, "?#"));
+	gboolean ret = g_str_has_suffix(path, suffix);
+
+	g_free(path);
+	return ret;
+}
+
+/* The GIF itself for a Tenor or Giphy (gifv) embed, which Discord describes
+ * by an MP4 video and a static thumbnail. NULL if it can't be told. */
+static gchar *
+discord_embed_gif_url(JsonObject *embed)
+{
+	const gchar *image = discord_embed_image_url(embed, "image");
+	JsonObject *video = json_object_get_object_member(embed, "video");
+	const gchar *video_url = video ? json_object_get_string_member(video, "url") : NULL;
+	JsonObject *thumbnail = json_object_get_object_member(embed, "thumbnail");
+	const gchar *thumb_url = thumbnail ? json_object_get_string_member(thumbnail, "url") : NULL;
+
+	if (image != NULL && discord_url_path_has_suffix(image, ".gif")) {
+		return g_strdup(image);
+	}
+
+	if (video_url != NULL && discord_url_path_has_suffix(video_url, ".mp4")) {
+		gchar *path = g_strndup(video_url, strcspn(video_url, "?#"));
+		gchar *ret = NULL;
+
+		if (g_str_has_prefix(path, "https://media.tenor.com/") || g_str_has_prefix(path, "https://c.tenor.com/")) {
+			/* https://media.tenor.com/<id><format>/<slug>.<ext>: format
+			 * AAAPo is the MP4, AAAAC the GIF */
+			gchar *slash = strrchr(path, '/');
+
+			if (slash != NULL && slash - path > 5 && strncmp(slash - 5, "AAAPo", 5) == 0) {
+				memcpy(slash - 5, "AAAAC", 5);
+				path[strlen(path) - 4] = '\0';
+				ret = g_strconcat(path, ".gif", NULL);
+			}
+		} else if (g_str_has_prefix(path, "https://media.giphy.com/media/") ||
+		           g_str_has_prefix(path, "https://i.giphy.com/")) {
+			path[strlen(path) - 4] = '\0';
+			ret = g_strconcat(path, ".gif", NULL);
+		}
+
+		g_free(path);
+
+		if (ret != NULL) {
+			return ret;
+		}
+	}
+
+	if (thumb_url != NULL && discord_url_path_has_suffix(thumb_url, ".gif")) {
+		return g_strdup(thumb_url);
+	}
+
+	return NULL;
+}
+
+/* The image an embed shows, if any: the GIF for gifv embeds, else the
+ * large image, else the thumbnail */
+static gchar *
+discord_embed_main_image(JsonObject *embed)
+{
+	const gchar *type = json_object_get_string_member(embed, "type");
+	const gchar *url;
+
+	if (purple_strequal(type, "gifv")) {
+		gchar *gif = discord_embed_gif_url(embed);
+
+		if (gif != NULL) {
+			return gif;
+		}
+	}
+
+	url = discord_embed_image_url(embed, "image");
+
+	if (url == NULL) {
+		url = discord_embed_image_url(embed, "thumbnail");
+	}
+
+	return g_strdup(url);
+}
+
+#define DISCORD_EMBED_DESCRIPTION_MAX 200
+
+/*
+ * One embed as a compact block the UI's renderer shows. A GIF (gifv) or a
+ * bare image link is just the image; anything else is
+ *   <b><a href=url>title</a></b><br/>description (at most ~200
+ *   characters)<br/>fields (rich embeds)<br/><img src=image>
+ * NULL if the embed has nothing to show.
+ */
+static gchar *
+discord_native_embed_html(JsonObject *embed)
+{
+	const gchar *type = json_object_get_string_member(embed, "type");
+	const gchar *title = json_object_get_string_member(embed, "title");
+	const gchar *url = json_object_get_string_member(embed, "url");
+	const gchar *description = json_object_get_string_member(embed, "description");
+	JsonObject *author = json_object_get_object_member(embed, "author");
+	JsonArray *fields = json_object_get_array_member(embed, "fields");
+	gchar *image = discord_embed_main_image(embed);
+	GString *str = g_string_new(NULL);
+	gchar *esc, *tmp;
+
+	if (!purple_strequal(type, "gifv") && !purple_strequal(type, "image")) {
+		if (title == NULL && author != NULL) {
+			title = json_object_get_string_member(author, "name");
+		}
+
+		if (title != NULL && *title) {
+			g_string_append(str, "<b>");
+
+			if (url != NULL) {
+				esc = purple_markup_escape_text(url, -1);
+				g_string_append_printf(str, "<a href=\"%s\">", esc);
+				g_free(esc);
+			}
+
+			esc = purple_markup_escape_text(title, -1);
+			g_string_append(str, esc);
+			g_free(esc);
+
+			if (url != NULL) {
+				g_string_append(str, "</a>");
+			}
+
+			g_string_append(str, "</b>");
+		}
+
+		if (description != NULL && *description) {
+			gchar *cut = discord_meta_preview(description, DISCORD_EMBED_DESCRIPTION_MAX);
+
+			if (cut != NULL) {
+				if (str->len > 0) {
+					g_string_append(str, "<br/>");
+				}
+
+				tmp = discord_embed_markdown(cut);
+				g_string_append(str, tmp);
+				g_free(tmp);
+				g_free(cut);
+			}
+		}
+
+		if (fields != NULL) {
+			guint j, fields_len = json_array_get_length(fields);
+
+			for (j = 0; j < fields_len; j++) {
+				JsonObject *field = json_array_get_object_element(fields, j);
+				const gchar *name = json_object_get_string_member(field, "name");
+				const gchar *value = json_object_get_string_member(field, "value");
+
+				if (str->len > 0) {
+					g_string_append(str, "<br/>");
+				}
+
+				if (name != NULL) {
+					tmp = discord_embed_markdown(name);
+					g_string_append_printf(str, "<b>%s</b> ", tmp);
+					g_free(tmp);
+				}
+
+				if (value != NULL) {
+					tmp = discord_embed_markdown(value);
+					g_string_append(str, tmp);
+					g_free(tmp);
+				}
+			}
+		}
+	}
+
+	if (image != NULL) {
+		if (str->len > 0) {
+			g_string_append(str, "<br/>");
+		}
+
+		esc = purple_markup_escape_text(image, -1);
+		g_string_append_printf(str, "<img src=\"%s\" alt=\"%s\"/>", esc,
+		                       purple_strequal(type, "gifv") ? "GIF" : _("Image"));
+		g_free(esc);
+		g_free(image);
+	}
+
+	return g_string_free(str, str->len == 0);
+}
+
+/* @body with the stickers and each embed's block appended, one per line */
+static gchar *
+discord_native_append_extras(const gchar *body, JsonArray *stickers, JsonArray *embeds)
+{
+	GString *str = g_string_new(body ? body : "");
+	gchar *html = discord_native_stickers_html(stickers);
+	guint n = 0, len = embeds ? json_array_get_length(embeds) : 0;
+
+	for (;;) {
+		if (html != NULL) {
+			if (str->len > 0) {
+				g_string_append(str, "<br/>");
+			}
+
+			g_string_append(str, html);
+			g_free(html);
+			html = NULL;
+		}
+
+		if (n >= len) {
+			break;
+		}
+
+		html = discord_native_embed_html(json_array_get_object_element(embeds, n++));
+	}
+
+	return g_string_free(str, FALSE);
+}
+
+/* The first embed's raw fields, for a UI that draws a card: embed-type,
+ * embed-title, embed-description, embed-url and embed-image */
+static void
+discord_meta_set_embed(GHashTable *meta, JsonObject *data)
+{
+	JsonArray *embeds = json_object_get_array_member(data, "embeds");
+	JsonObject *embed;
+	gchar *image;
+
+	if (embeds == NULL || json_array_get_length(embeds) == 0 ||
+	    (embed = json_array_get_object_element(embeds, 0)) == NULL) {
+		return;
+	}
+
+	discord_meta_set(meta, "embed-type", json_object_get_string_member(embed, "type"));
+	discord_meta_set(meta, "embed-title", json_object_get_string_member(embed, "title"));
+	discord_meta_set(meta, "embed-description", json_object_get_string_member(embed, "description"));
+	discord_meta_set(meta, "embed-url", json_object_get_string_member(embed, "url"));
+	image = discord_embed_main_image(embed);
+	discord_meta_set(meta, "embed-image", image);
+	g_free(image);
+}
+
+/* The name the UI knows @channel_id's conversation by (a thread's parent
+ * channel for thread messages), and whether it is a room */
+static gchar *
+discord_native_conv_name(DiscordAccount *da, guint64 channel_id, gboolean *is_chat)
+{
+	gchar *channel_id_s = from_int(channel_id);
+	const gchar *username = g_hash_table_lookup(da->one_to_ones, channel_id_s);
+	gchar *ret;
+
+	if (username != NULL) {
+		*is_chat = FALSE;
+		ret = g_strdup(username);
+	} else {
+		if (discord_get_channel_global_int(da, channel_id) == NULL) {
+			DiscordChannel *thread = discord_get_thread_global_int_guild(da, channel_id, NULL);
+
+			if (thread != NULL) {
+				channel_id = thread->parent_id;
+			}
+		}
+
+		*is_chat = TRUE;
+		ret = from_int(channel_id);
+	}
+
+	g_free(channel_id_s);
+	return ret;
+}
+
+/* The sender name of @user_id as the UI knows it in @channel_id's
+ * conversation: the nick in rooms, the username in IMs, and our own account
+ * name for ourselves in IMs */
+static gchar *
+discord_native_sender(DiscordAccount *da, guint64 channel_id, guint64 user_id, gboolean is_chat)
+{
+	DiscordGuild *guild = NULL;
+	DiscordChannel *channel;
+
+	if (!is_chat) {
+		gchar *name;
+
+		if (user_id == da->self_user_id) {
+			return g_strdup(purple_account_get_username(da->account));
+		}
+
+		name = discord_create_fullname_from_id(da, user_id);
+
+		if (name == NULL) {
+			gchar *channel_id_s = from_int(channel_id);
+
+			name = g_strdup(g_hash_table_lookup(da->one_to_ones, channel_id_s));
+			g_free(channel_id_s);
+		}
+
+		return name;
+	}
+
+	channel = discord_get_channel_global_int_guild(da, channel_id, &guild);
+
+	if (channel == NULL) {
+		DiscordChannel *thread = discord_get_thread_global_int_guild(da, channel_id, &guild);
+
+		if (thread != NULL) {
+			channel = discord_get_channel_global_int(da, thread->parent_id);
+		}
+	}
+
+	return discord_create_nickname_from_id(da, guild, channel, user_id);
+}
+
+/* The sender of message object @data (by @author_obj) as the UI knows it */
+static gchar *
+discord_native_message_sender(DiscordAccount *da, JsonObject *author_obj, JsonObject *data,
+                              DiscordGuild *guild, DiscordChannel *channel, gboolean is_chat)
+{
+	DiscordUser *author;
+
+	if (author_obj == NULL || json_object_get_string_member(author_obj, "id") == NULL) {
+		return NULL;
+	}
+
+	if (!is_chat && to_int(json_object_get_string_member(author_obj, "id")) == da->self_user_id) {
+		return g_strdup(purple_account_get_username(da->account));
+	}
+
+	if (is_chat && json_object_has_member(data, "webhook_id")) {
+		return g_strdup(json_object_get_string_member(author_obj, "username"));
+	}
+
+	author = discord_upsert_user(da->new_users, author_obj);
+
+	return is_chat ? discord_create_nickname(author, guild, channel) : discord_create_fullname(author);
+}
+
+/*
+ * Emits receiving-message-meta for the write of message @data that follows.
+ * Returns TRUE if the UI already has the message, which is then dropped.
+ */
+static gboolean
+discord_native_before_write(DiscordAccount *da, JsonObject *data, const gchar *conv_name, gboolean is_chat,
+                            const gchar *sender, gboolean outgoing, unsigned special_type, const gchar *reply_sender)
+{
+	GHashTable *meta = discord_message_meta_build(data, is_chat, sender, outgoing,
+	                                              special_type == DISCORD_MESSAGE_NORMAL, reply_sender);
+
+	if (special_type == DISCORD_MESSAGE_EDITED) {
+		discord_meta_set(meta, "correction-of", json_object_get_string_member(data, "id"));
+	}
+
+	discord_meta_set_embed(meta, data);
+
+	if (da->history_older) {
+		/* A scroll-back page: the UI prepends it */
+		discord_meta_set(meta, "mam", "1");
+		discord_meta_set(meta, "mam-query", "older");
+	}
+
+	if (special_type == DISCORD_MESSAGE_NORMAL && !outgoing &&
+	    to_int(json_object_get_string_member(json_object_get_object_member(data, "author"), "id")) != da->self_user_id) {
+		/* The UI sends send-marker for it when it has been seen */
+		discord_meta_set(meta, "markable", "1");
+	}
+
+	if (discord_emit_message_meta(da, conv_name, meta)) {
+		purple_debug_info("discord", "Message %s is shown already\n", json_object_get_string_member(data, "id"));
+		return TRUE;
+	}
+
+	return FALSE;
+}
+
+/* The newest message known to be read in @channel_id (0: none) */
+static guint64
+discord_native_read_get(DiscordAccount *da, guint64 channel_id)
+{
+	guint64 *id = g_hash_table_lookup(da->read_acked, &channel_id);
+
+	return id ? *id : 0;
+}
+
+/* Notes that @msg_id and everything before it in @channel_id is read.
+ * FALSE if that was known already. */
+static gboolean
+discord_native_read_set(DiscordAccount *da, guint64 channel_id, guint64 msg_id)
+{
+	if (msg_id == 0 || msg_id <= discord_native_read_get(da, channel_id)) {
+		return FALSE;
+	}
+
+	g_hash_table_replace(da->read_acked, g_memdup2(&channel_id, sizeof(guint64)),
+	                     g_memdup2(&msg_id, sizeof(guint64)));
+	return TRUE;
+}
+
+/*
+ * MESSAGE_ACK: we read a channel up to a message on another client (or
+ * this one). Emits message-receipt(account, conv, message id, "displayed",
+ * our account name), which a message-meta UI takes as "read elsewhere" and
+ * clears the conversation's unread state. Thread acks are skipped: the UI
+ * shows threads inside their parent channel's conversation.
+ */
+static void
+discord_native_message_ack(DiscordAccount *da, JsonObject *data)
+{
+	guint64 channel_id = to_int(json_object_get_string_member(data, "channel_id"));
+	const gchar *msg_id = json_object_get_string_member(data, "message_id");
+	gchar *channel_id_s, *conv_name;
+	gboolean is_chat;
+
+	if (channel_id == 0 || msg_id == NULL || to_int(msg_id) == 0) {
+		return;
+	}
+
+	channel_id_s = from_int(channel_id);
+
+	if (!g_hash_table_contains(da->one_to_ones, channel_id_s) &&
+	    discord_get_channel_global_int(da, channel_id) == NULL &&
+	    discord_get_thread_global_int_guild(da, channel_id, NULL) != NULL) {
+		g_free(channel_id_s);
+		return;
+	}
+
+	g_free(channel_id_s);
+
+	if (!discord_native_read_set(da, channel_id, to_int(msg_id))) {
+		/* Known already: the echo of our own ack, or an older one */
+		return;
+	}
+
+	conv_name = discord_native_conv_name(da, channel_id, &is_chat);
+	purple_signal_emit_return_1(purple_conversations_get_handle(), "message-receipt",
+		da->account, conv_name, msg_id, "displayed", purple_account_get_username(da->account));
+	g_free(conv_name);
+}
+
+/* Remembers which reactions on a message are ours (for send-reaction) */
+static void
+discord_native_note_own_reactions(DiscordAccount *da, const gchar *msg_id, JsonArray *reactions)
+{
+	guint n, len = json_array_get_length(reactions);
+
+	for (n = 0; n < len; n++) {
+		JsonObject *reaction = json_array_get_object_element(reactions, n);
+		JsonObject *emoji = json_object_get_object_member(reaction, "emoji");
+		gchar *display = discord_reaction_emoji_display(da, emoji);   /* learns custom ids */
+		gchar *api = discord_reaction_emoji_api_from_json(emoji);
+
+		discord_own_reactions_update(da, msg_id, api, json_object_get_boolean_member(reaction, "me"));
+		g_free(api);
+		g_free(display);
+	}
+}
+
+/*
+ * MESSAGE_DELETE(_BULK): emits message-retracted for each id (@bulk_ids, or
+ * @single_id). TRUE if the UI marked all of them; otherwise the caller
+ * writes its usual line. Only messages whose author we know are passed on:
+ * without it, the UI would take a deletion in a room for moderation.
+ */
+static gboolean
+discord_native_deleted(DiscordAccount *da, const gchar *channel_id_s, JsonArray *bulk_ids, const gchar *single_id)
+{
+	gboolean is_chat, all = TRUE;
+	gchar *conv_name = discord_native_conv_name(da, to_int(channel_id_s), &is_chat);
+	guint i, len = bulk_ids ? json_array_get_length(bulk_ids) : 1;
+
+	for (i = 0; i < len; i++) {
+		const gchar *id = bulk_ids ? json_array_get_string_element(bulk_ids, i) : single_id;
+		DiscordMsgInfo *info = id ? g_hash_table_lookup(da->msg_info, id) : NULL;
+
+		if (info == NULL || info->sender == NULL || !discord_emit_retracted(da, conv_name, id, info->sender)) {
+			all = FALSE;
+		}
+	}
+
+	g_free(conv_name);
+	return all;
+}
+
+/*
+ * MESSAGE_REACTION_ADD/REMOVE: emits message-reaction. TRUE if the UI
+ * showed it; otherwise the caller writes its usual line.
+ */
+static gboolean
+discord_native_reaction(DiscordAccount *da, JsonObject *data, gboolean add)
+{
+	guint64 channel_id = to_int(json_object_get_string_member(data, "channel_id"));
+	const gchar *msg_id = json_object_get_string_member(data, "message_id");
+	guint64 user_id = to_int(json_object_get_string_member(data, "user_id"));
+	JsonObject *emoji = json_object_get_object_member(data, "emoji");
+	JsonObject *member = json_object_get_object_member(data, "member");
+	gchar *display, *api, *conv_name, *sender;
+	gboolean is_chat, handled = FALSE;
+
+	if (channel_id == 0 || msg_id == NULL || user_id == 0) {
+		return FALSE;
+	}
+
+	display = discord_reaction_emoji_display(da, emoji);
+	api = discord_reaction_emoji_api_from_json(emoji);
+
+	if (user_id == da->self_user_id) {
+		discord_own_reactions_update(da, msg_id, api, add);
+	}
+
+	/* Guild reactions carry the member: someone we haven't seen yet */
+	if (discord_get_user(da, user_id) == NULL && json_object_get_object_member(member, "user") != NULL) {
+		discord_upsert_user(da->new_users, json_object_get_object_member(member, "user"));
+	}
+
+	conv_name = discord_native_conv_name(da, channel_id, &is_chat);
+	sender = discord_native_sender(da, channel_id, user_id, is_chat);
+
+	if (display != NULL && sender != NULL) {
+		handled = discord_emit_reaction(da, conv_name, msg_id, display, sender, add);
+	}
+
+	g_free(sender);
+	g_free(conv_name);
+	g_free(api);
+	g_free(display);
+	return handled;
+}
+
+/*
+ * Reactions on history messages (native_meta). The message object only
+ * has counts, so the reactors of each emoji are fetched
+ * (GET .../reactions/{emoji}?limit=100) and passed on as
+ * message-reaction(..., add = TRUE), one per user. Only the newest
+ * "reaction_history_limit" (default 25) messages queued are fetched, one
+ * request at a time, at most about three a second, and slower when the
+ * endpoint's X-RateLimit-Remaining reaches 0 (until its Reset-After).
+ */
+#define DISCORD_REACTION_INTERVAL_MS 350
+
+typedef struct {
+	guint64 channel_id;
+	gchar *msg_id;
+	DiscordReactionEmoji *emoji;
+} DiscordReactionFetch;
+
+static gboolean discord_native_reactions_next(gpointer data);
+
+static void
+discord_native_reactions_kick(DiscordAccount *da)
+{
+	guint delay = DISCORD_REACTION_INTERVAL_MS;
+
+	if (da->reaction_msgs == NULL || da->reaction_busy || da->reaction_timer != 0 ||
+	    g_queue_is_empty(da->reaction_msgs)) {
+		return;
+	}
+
+	if (da->reaction_rl_remaining == 0) {
+		delay = MAX(delay, (guint) (da->reaction_rl_reset_after * 1000));
+	}
+
+	da->reaction_timer = purple_timeout_add(delay, discord_native_reactions_next, da);
+}
+
+static void
+discord_native_reactors_cb(DiscordAccount *da, JsonNode *node, gpointer user_data)
+{
+	DiscordReactionFetch *fetch = user_data;
+	JsonArray *users = (node != NULL && JSON_NODE_HOLDS_ARRAY(node)) ? json_node_get_array(node) : NULL;
+	guint i, len = users ? json_array_get_length(users) : 0;
+	gboolean is_chat;
+	gchar *conv_name = NULL;
+
+	if (len > 0 && da->reaction_msgs != NULL) {
+		conv_name = discord_native_conv_name(da, fetch->channel_id, &is_chat);
+	}
+
+	for (i = 0; conv_name != NULL && i < len; i++) {
+		JsonObject *user_obj = json_array_get_object_element(users, i);
+		guint64 user_id = to_int(json_object_get_string_member(user_obj, "id"));
+		gchar *sender;
+
+		if (user_id == 0) {
+			continue;
+		}
+
+		if (discord_get_user(da, user_id) == NULL) {
+			discord_upsert_user(da->new_users, user_obj);
+		}
+
+		if (user_id == da->self_user_id) {
+			discord_own_reactions_update(da, fetch->msg_id, fetch->emoji->api, TRUE);
+		}
+
+		sender = discord_native_sender(da, fetch->channel_id, user_id, is_chat);
+
+		if (sender != NULL) {
+			discord_emit_reaction(da, conv_name, fetch->msg_id, fetch->emoji->display, sender, TRUE);
+		}
+
+		g_free(sender);
+	}
+
+	g_free(conv_name);
+	g_free(fetch->msg_id);
+	discord_reaction_emoji_free(fetch->emoji);
+	g_free(fetch);
+
+	if (da->reaction_msgs != NULL) {
+		da->reaction_busy = FALSE;
+		discord_native_reactions_kick(da);
+	}
+}
+
+static gboolean
+discord_native_reactions_next(gpointer data)
+{
+	DiscordAccount *da = data;
+	DiscordReactionMsg *msg = g_queue_peek_head(da->reaction_msgs);
+	DiscordReactionFetch *fetch;
+	gchar *url;
+
+	da->reaction_timer = 0;
+
+	if (msg == NULL) {
+		return FALSE;
+	}
+
+	fetch = g_new0(DiscordReactionFetch, 1);
+	fetch->channel_id = msg->channel_id;
+	fetch->msg_id = g_strdup(msg->msg_id);
+	fetch->emoji = g_queue_pop_head(&msg->emojis);
+
+	if (g_queue_is_empty(&msg->emojis)) {
+		discord_reaction_msg_free(g_queue_pop_head(da->reaction_msgs));
+	}
+
+	url = g_strdup_printf("https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/channels/%" G_GUINT64_FORMAT "/messages/%s/reactions/%s?limit=100",
+	                      fetch->channel_id, fetch->msg_id, purple_url_encode(fetch->emoji->api));
+	da->reaction_busy = TRUE;
+	discord_fetch_url(da, url, NULL, discord_native_reactors_cb, fetch);
+	g_free(url);
+
+	return FALSE;
+}
+
+/* Queues the reactors of @msg_id's @reactions (a history message) */
+static void
+discord_native_queue_reactions(DiscordAccount *da, guint64 channel_id, const gchar *msg_id, JsonArray *reactions)
+{
+	gint limit = purple_account_get_int(da->account, "reaction_history_limit", 25);
+	guint n, len = reactions ? json_array_get_length(reactions) : 0;
+	DiscordReactionMsg *msg;
+
+	if (limit <= 0 || len == 0 || msg_id == NULL || channel_id == 0) {
+		return;
+	}
+
+	msg = g_new0(DiscordReactionMsg, 1);
+	msg->channel_id = channel_id;
+	msg->msg_id = g_strdup(msg_id);
+	g_queue_init(&msg->emojis);
+
+	for (n = 0; n < len; n++) {
+		JsonObject *emoji_obj = json_object_get_object_member(json_array_get_object_element(reactions, n), "emoji");
+		DiscordReactionEmoji *emoji;
+		gchar *api = discord_reaction_emoji_api_from_json(emoji_obj);
+		gchar *display = discord_reaction_emoji_display(da, emoji_obj);
+
+		if (api == NULL || display == NULL) {
+			g_free(api);
+			g_free(display);
+			continue;
+		}
+
+		emoji = g_new0(DiscordReactionEmoji, 1);
+		emoji->api = api;
+		emoji->display = display;
+		g_queue_push_tail(&msg->emojis, emoji);
+	}
+
+	if (g_queue_is_empty(&msg->emojis)) {
+		discord_reaction_msg_free(msg);
+		return;
+	}
+
+	g_queue_push_tail(da->reaction_msgs, msg);
+
+	/* Only the newest @limit messages */
+	while (g_queue_get_length(da->reaction_msgs) > (guint) limit) {
+		discord_reaction_msg_free(g_queue_pop_head(da->reaction_msgs));
+	}
+
+	discord_native_reactions_kick(da);
+}
+
 static guint64
 discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_type)
 {
@@ -3017,6 +4380,27 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 		/* Possibly edited message? */
 		purple_debug_info("discord", "No author in message processed\n");
 		return msg_id;
+	}
+
+	/* An update that isn't an edit: link embeds arriving (native_meta) */
+	gboolean embed_only = FALSE;
+
+	if (edited && da->native_meta && json_object_get_string_member(data, "edited_timestamp") == NULL) {
+		JsonArray *update_embeds = json_object_get_array_member(data, "embeds");
+		guint n, update_embeds_len = update_embeds ? json_array_get_length(update_embeds) : 0;
+
+		for (n = 0; n < update_embeds_len && !embed_only; n++) {
+			gchar *html = discord_native_embed_html(json_array_get_object_element(update_embeds, n));
+
+			embed_only = html != NULL;
+			g_free(html);
+		}
+
+		if (!embed_only) {
+			/* Nothing the UI would show differently */
+			purple_debug_info("discord", "Ignoring a message update without an edit\n");
+			return msg_id;
+		}
 	}
 
 	JsonObject *author_obj = json_object_get_object_member(data, "author");
@@ -3086,6 +4470,11 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 		flags = PURPLE_MESSAGE_RECV;
 	}
 
+	if (da->native_meta && da->history_older) {
+		/* A scroll-back page (mam-fetch-older) */
+		flags |= PURPLE_MESSAGE_DELAYED;
+	}
+
 	/* Check for mentions, but only if the user has not globally disabled
 	 * mentions for the channel. If the level is ALL or MENTIONS, it's
 	 * okay; we just check for NONE */
@@ -3142,7 +4531,12 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 	conv = discord_get_conv_from_channel_id(da, channel_id);
 
 	/* Replace <:emoji:id> with emojis */
-	tmp = g_regex_replace_eval(emoji_regex, escaped_content, -1, 0, 0, discord_replace_emoji, conv, NULL);
+	if (da->native_meta) {
+		/* The UI loads the image itself */
+		tmp = g_regex_replace_eval(emoji_regex, escaped_content, -1, 0, 0, discord_replace_emoji_native, da, NULL);
+	} else {
+		tmp = g_regex_replace_eval(emoji_regex, escaped_content, -1, 0, 0, discord_replace_emoji, conv, NULL);
+	}
 
 	if (tmp != NULL) {
 		g_free(escaped_content);
@@ -3162,8 +4556,8 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 	g_free(escaped_content);
 	escaped_content = tmp;
 
-	/* Add prefix for edited/pinned messages */
-	if (edited || pinned) {
+	/* Add prefix for edited/pinned messages (native edits: see below) */
+	if (pinned || (edited && !da->native_meta)) {
 		const gchar *prefix_fmt = pinned ? "📌 %s" : _("EDIT: %s");
 
 		tmp = g_strdup_printf(prefix_fmt, escaped_content);
@@ -3199,6 +4593,15 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 			tmp = NULL;
 		}
 		g_free(thread_ts);
+	}
+
+	if (da->native_meta) {
+		/* Images the UI loads itself, and compact embed blocks */
+		tmp = discord_native_append_extras(escaped_content, stickers, embeds);
+		g_free(escaped_content);
+		escaped_content = tmp;
+		stickers = NULL;
+		embeds = NULL;
 	}
 
 	if (stickers != NULL) {
@@ -3376,11 +4779,74 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 		}
 	}
 
+	/* Native metadata (see discord_message_meta_build()); unused otherwise */
+	gboolean native = da->native_meta;
+	gboolean native_own_echo = FALSE;       /* our own send, shown when the server echoes it */
+	gboolean native_discard = FALSE;        /* the UI has this message already */
+	gboolean native_attachments_merged = FALSE;
+	gboolean native_is_chat = !(channel_id_s && g_hash_table_contains(da->one_to_ones, channel_id_s));
+	const gchar *msg_id_s = json_object_get_string_member(data, "id");
+	gchar *native_sender = NULL;
+	gchar *native_reply_sender = NULL;
+
+	if (native) {
+		if (author_id == da->self_user_id && nonce != NULL && g_hash_table_remove(da->deferred_echo, nonce)) {
+			g_hash_table_remove(da->sent_message_ids, nonce);
+			native_own_echo = TRUE;
+			flags = PURPLE_MESSAGE_SEND;
+		}
+
+		native_sender = discord_native_message_sender(da, author_obj, data, guild, channel, native_is_chat);
+
+		if (referenced_message != NULL) {
+			native_reply_sender = discord_native_message_sender(da,
+				json_object_get_object_member(referenced_message, "author"), referenced_message,
+				guild, channel, native_is_chat);
+		}
+
+		if (edited) {
+			gchar *conv_name = native_is_chat ? g_strdup(channel_id_s) : g_strdup(g_hash_table_lookup(da->one_to_ones, channel_id_s));
+			gboolean handled;
+
+			if (embed_only) {
+				/* Describes the correction that follows: the UI may show it
+				 * without an "edited" mark */
+				GHashTable *meta = discord_meta_new();
+
+				discord_meta_set(meta, "conv-type", native_is_chat ? "chat" : "im");
+				discord_meta_set(meta, "sender", native_sender);
+				discord_meta_set(meta, "correction-of", msg_id_s);
+				discord_meta_set(meta, "embed-only-update", "1");
+				discord_meta_set_embed(meta, data);
+				discord_emit_message_meta(da, conv_name, meta);
+			}
+
+			handled = discord_emit_corrected(da, conv_name, msg_id_s, escaped_content, native_sender);
+
+			g_free(conv_name);
+
+			if (handled || embed_only) {
+				/* An embed-only update of a message the UI doesn't show:
+				 * nothing, rather than an EDIT: line of unchanged text */
+				g_free(native_sender);
+				g_free(native_reply_sender);
+				g_free(escaped_content);
+				g_free(channel_id_s);
+				return msg_id;
+			}
+
+			/* The UI doesn't show the message: a new line, as before */
+			tmp = g_strdup_printf(_("EDIT: %s"), escaped_content);
+			g_free(escaped_content);
+			escaped_content = tmp;
+		}
+	}
+
 	if (channel_id_s && g_hash_table_contains(da->one_to_ones, channel_id_s)) {
 		/* private message */
 
 		if (author_id == da->self_user_id) {
-			if (!nonce || !g_hash_table_remove(da->sent_message_ids, nonce)) {
+			if (native_own_echo || !nonce || !g_hash_table_remove(da->sent_message_ids, nonce)) {
 				PurpleMessage *msg;
 
 				gchar *username = g_hash_table_lookup(da->one_to_ones, channel_id_s);
@@ -3395,22 +4861,38 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 					conv = PURPLE_CONVERSATION(imconv);
 				}
 
-				if (escaped_content && *escaped_content) {
-					msg = purple_message_new_outgoing(username, escaped_content, flags);
-					purple_message_set_time(msg, timestamp);
-					purple_conversation_write_message(conv, msg);
-					purple_message_destroy(msg);
-				}
+				if (native) {
+					/* One row: the text and its attachments */
+					gchar *body = discord_append_attachments_html(da, escaped_content, attachments);
 
-				if (attachments) {
-					for (i = json_array_get_length(attachments) - 1; i >= 0; i--) {
-						JsonObject *attachment = json_array_get_object_element(attachments, i);
-						const gchar *url = json_object_get_string_member(attachment, "url");
-
-						msg = purple_message_new_outgoing(username, url, flags);
+					if (*body && !(native_discard = discord_native_before_write(da, data, username, FALSE,
+					                                  native_sender, !native_own_echo, special_type, native_reply_sender))) {
+						msg = purple_message_new_outgoing(username, body, flags);
 						purple_message_set_time(msg, timestamp);
 						purple_conversation_write_message(conv, msg);
 						purple_message_destroy(msg);
+						discord_remember_message(da, special_type == DISCORD_MESSAGE_CONTEXT ? NULL : msg_id_s, id, native_sender);
+					}
+
+					g_free(body);
+				} else {
+					if (escaped_content && *escaped_content) {
+						msg = purple_message_new_outgoing(username, escaped_content, flags);
+						purple_message_set_time(msg, timestamp);
+						purple_conversation_write_message(conv, msg);
+						purple_message_destroy(msg);
+					}
+
+					if (attachments) {
+						for (i = json_array_get_length(attachments) - 1; i >= 0; i--) {
+							JsonObject *attachment = json_array_get_object_element(attachments, i);
+							const gchar *url = json_object_get_string_member(attachment, "url");
+
+							msg = purple_message_new_outgoing(username, url, flags);
+							purple_message_set_time(msg, timestamp);
+							purple_conversation_write_message(conv, msg);
+							purple_message_destroy(msg);
+						}
 					}
 				}
 			}
@@ -3418,7 +4900,8 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 			DiscordUser *author = discord_upsert_user(da->new_users, author_obj);
 			gchar *merged_username = discord_create_fullname(author);
 
-			if (referenced_message != NULL) {
+			/* Native: the UI shows the reply itself (reply-to) */
+			if (referenced_message != NULL && !native) {
 
 				gchar *reply_txt = discord_get_reply_text(da, guild, channel, referenced_message);
 
@@ -3426,7 +4909,19 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 				g_free(reply_txt);
 			}
 
-			if (escaped_content && *escaped_content && msg_type != MESSAGE_CALL) {
+			if (native && msg_type != MESSAGE_CALL) {
+				/* One row: the text and its attachments */
+				gchar *body = discord_append_attachments_html(da, escaped_content, attachments);
+
+				if (*body && !(native_discard = discord_native_before_write(da, data, merged_username, FALSE,
+				                                  native_sender, FALSE, special_type, native_reply_sender))) {
+					purple_serv_got_im(da->pc, merged_username, body, flags, timestamp);
+					discord_remember_message(da, special_type == DISCORD_MESSAGE_CONTEXT ? NULL : msg_id_s, id, native_sender);
+				}
+
+				native_attachments_merged = TRUE;
+				g_free(body);
+			} else if (escaped_content && *escaped_content && msg_type != MESSAGE_CALL) {
 				purple_serv_got_im(da->pc, merged_username, escaped_content, flags, timestamp);
 			} else if (msg_type == MESSAGE_CALL) {
 				gchar *call_txt = g_strdup_printf(_("%s started a call"), merged_username);
@@ -3434,7 +4929,7 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 				g_free(call_txt);
 			}
 
-			if (attachments) {
+			if (attachments && !native_attachments_merged) {
 				for (i = json_array_get_length(attachments) - 1; i >= 0; i--) {
 					JsonObject *attachment = json_array_get_object_element(attachments, i);
 
@@ -3489,7 +4984,17 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 			g_free(merged_username);
 		}
 
-		if (reactions != NULL && purple_account_get_bool(da->account, "show-reactions", TRUE)) {
+		if (native) {
+			discord_native_note_own_reactions(da, msg_id_s, reactions);
+
+			if (reactions != NULL && !native_discard && special_type == DISCORD_MESSAGE_NORMAL &&
+			    purple_account_get_bool(da->account, "show-reactions", TRUE)) {
+				/* Who reacted, on the message itself */
+				discord_native_queue_reactions(da, id, msg_id_s, reactions);
+			}
+		}
+
+		if (reactions != NULL && !native && purple_account_get_bool(da->account, "show-reactions", TRUE)) {
 			const gchar *username = g_hash_table_lookup(da->one_to_ones, channel_id_s);
 
 			guint reactions_len = json_array_get_length(reactions);
@@ -3535,7 +5040,7 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 			}
 		}
 
-	} else if (!nonce || !g_hash_table_remove(da->sent_message_ids, nonce)) {
+	} else if (native_own_echo || !nonce || !g_hash_table_remove(da->sent_message_ids, nonce)) {
 		/* Open the buffer if it's not already */
 		gboolean mentioned = flags & PURPLE_MESSAGE_NICK;
 
@@ -3550,6 +5055,8 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 
 			gboolean fetched_history = discord_join_chat_by_id(da, channel_id, mentioned);
 			if (fetched_history) {
+				g_free(native_sender);
+				g_free(native_reply_sender);
 				g_free(escaped_content);
 				g_free(channel_id_s);
 				return msg_id;
@@ -3566,7 +5073,8 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 		/* For system lines, which are HTML; name itself is used as the sender */
 		gchar *escaped_name = purple_markup_escape_text(name ? name : "", -1);
 
-		if (referenced_message != NULL && msg_type != MESSAGE_THREAD_STARTER_MESSAGE) {
+		/* Native: the UI shows the reply itself (reply-to) */
+		if (referenced_message != NULL && msg_type != MESSAGE_THREAD_STARTER_MESSAGE && !native) {
 			gchar *reply_txt = discord_get_reply_text(da, guild, channel, referenced_message);
 			if (conv == NULL) {
 				PurpleChatConversation *chatconv = purple_conversations_find_chat(da->pc, discord_chat_hash(channel_id));
@@ -3579,7 +5087,31 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 			g_free(reply_txt);
 		}
 
-		if (
+		gboolean native_plain_message =
+				msg_type != MESSAGE_GUILD_MEMBER_JOIN &&
+				msg_type != MESSAGE_CALL &&
+				msg_type != MESSAGE_THREAD_CREATED &&
+				msg_type != MESSAGE_THREAD_STARTER_MESSAGE;
+
+		if (native && native_plain_message) {
+			/* One row: the text and its attachments */
+			gchar *body = discord_append_attachments_html(da, escaped_content, attachments);
+
+			if (*body && !(native_discard = discord_native_before_write(da, data, channel_id_s, TRUE, name,
+			                                  author_id == da->self_user_id && !native_own_echo,
+			                                  special_type, native_reply_sender))) {
+				purple_serv_got_chat_in(da->pc, discord_chat_hash(channel_id), name, flags, body, timestamp);
+				discord_remember_message(da, special_type == DISCORD_MESSAGE_CONTEXT ? NULL : msg_id_s, id, name);
+			}
+
+			if (conv == NULL) {
+				PurpleChatConversation *chatconv = purple_conversations_find_chat(da->pc, discord_chat_hash(channel_id));
+				conv = PURPLE_CONVERSATION(chatconv);
+			}
+
+			native_attachments_merged = TRUE;
+			g_free(body);
+		} else if (
 				escaped_content &&
 				*escaped_content &&
 				msg_type != MESSAGE_GUILD_MEMBER_JOIN &&
@@ -3670,7 +5202,7 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 			}
 		}
 
-		if (attachments) {
+		if (attachments && !native_attachments_merged) {
 			for (i = json_array_get_length(attachments) - 1; i >= 0; i--) {
 				JsonObject *attachment = json_array_get_object_element(attachments, i);
 
@@ -3722,7 +5254,17 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 			}
 		}
 
-		if (reactions != NULL && purple_account_get_bool(da->account, "show-reactions", TRUE)) {
+		if (native) {
+			discord_native_note_own_reactions(da, msg_id_s, reactions);
+
+			if (reactions != NULL && !native_discard && special_type == DISCORD_MESSAGE_NORMAL &&
+			    purple_account_get_bool(da->account, "show-reactions", TRUE)) {
+				/* Who reacted, on the message itself */
+				discord_native_queue_reactions(da, id, msg_id_s, reactions);
+			}
+		}
+
+		if (reactions != NULL && !native && purple_account_get_bool(da->account, "show-reactions", TRUE)) {
 			if (conv == NULL) {
 				PurpleChatConversation *chatconv = purple_conversations_find_chat(da->pc, discord_chat_hash(channel_id));
 				conv = PURPLE_CONVERSATION(chatconv);
@@ -3773,6 +5315,8 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 		g_free(name);
 	}
 
+	g_free(native_sender);
+	g_free(native_reply_sender);
 	g_free(escaped_content);
 
 	if (channel != NULL && msg_id > channel->last_message_id && !thread) {
@@ -4205,6 +5749,68 @@ discord_handle_guild_member_update(DiscordAccount *da, guint64 guild_id, JsonObj
 
 static void discord_send_lazy_guild_request(DiscordAccount *da, DiscordGuild *guild);
 
+/* Activity types that are a game or a stream, song or show: playing,
+ * streaming, listening, watching, competing (not 4, a custom status) */
+#define DISCORD_ACTIVITY_IS_GAME(type) ((type) == 0 || (type) == 1 || (type) == 2 || (type) == 3 || (type) == 5)
+
+/* The first game-like activity of a presence (PRESENCE_UPDATE data or a
+ * READY presence), or its legacy "game" object; NULL for none */
+static JsonObject *
+discord_presence_game_activity(JsonObject *presence)
+{
+	JsonArray *activities = json_object_get_array_member(presence, "activities");
+	JsonObject *game;
+	guint n, len = activities ? json_array_get_length(activities) : 0;
+
+	for (n = 0; n < len; n++) {
+		JsonObject *activity = json_array_get_object_element(activities, n);
+
+		if (activity != NULL && json_object_get_string_member(activity, "name") != NULL &&
+		    DISCORD_ACTIVITY_IS_GAME(json_object_get_int_member(activity, "type"))) {
+			return activity;
+		}
+	}
+
+	game = json_object_get_object_member(presence, "game");
+
+	if (game != NULL && json_object_get_string_member(game, "name") != NULL &&
+	    !purple_strequal(json_object_get_string_member(game, "id"), "custom") &&
+	    DISCORD_ACTIVITY_IS_GAME(json_object_get_int_member(game, "type"))) {
+		return game;
+	}
+
+	return NULL;
+}
+
+/*
+ * purple_prpl_got_user_status() for a buddy. With native metadata (and
+ * status types that have them, see discord_status_types()) the status also
+ * gets the "game" (the activity's name) and "game_app_id" (its
+ * application_id) attributes from @presence, which pidgin4 shows on the
+ * buddy row and in the tooltip; they are unset without a game.
+ */
+static void
+discord_got_user_status(DiscordAccount *da, const gchar *username, const gchar *status,
+                        const gchar *message, JsonObject *presence)
+{
+	PurpleStatusType *type = (da->native_meta && status != NULL) ? purple_account_get_status_type(da->account, status) : NULL;
+
+	if (type != NULL && purple_status_type_get_attr(type, "game") != NULL) {
+		JsonObject *game = presence ? discord_presence_game_activity(presence) : NULL;
+		const gchar *game_name = game ? json_object_get_string_member(game, "name") : NULL;
+		const gchar *app_id = game ? json_object_get_string_member(game, "application_id") : NULL;
+
+		if (purple_strequal(status, "offline")) {
+			game_name = app_id = NULL;
+		}
+
+		purple_protocol_got_user_status(da->account, username, status, "message", message,
+		                                "game", game_name, "game_app_id", app_id, NULL);
+	} else {
+		purple_protocol_got_user_status(da->account, username, status, "message", message, NULL);
+	}
+}
+
 static void
 discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data)
 {
@@ -4263,7 +5869,7 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 
 		} else if (username) {
 			const gchar *status = json_object_get_string_member(data, "status");
-			purple_protocol_got_user_status(da->account, username, status, "message", user->game ? user->game : user->custom_status, NULL);
+			discord_got_user_status(da, username, status, user->game ? user->game : user->custom_status, data);
 			purple_protocol_got_user_idle(da->account, username, idle_since ? TRUE : FALSE, 0);
 
 			// Check avatar updates
@@ -4318,7 +5924,7 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 				}
 
 				// Change status to the new user
-				purple_protocol_got_user_status(da->account, new_username_full, status, "message", user->game ? user->game : user->custom_status, NULL);
+				discord_got_user_status(da, new_username_full, status, user->game ? user->game : user->custom_status, data);
 				purple_protocol_got_user_idle(da->account, new_username_full, idle_since ? TRUE : FALSE, 0);
 				purple_protocol_got_user_status(da->account, username, "offline", NULL);
 
@@ -4436,6 +6042,10 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 		discord_set_group_typing(&ctx);
 
 		g_free(n);
+	} else if (da->native_meta && purple_strequal(type, "MESSAGE_ACK")) {
+		/* Read on another client: the UI clears the unread state */
+		discord_native_message_ack(da, data);
+
 	} else if (purple_strequal(type, "MESSAGE_DELETE") || purple_strequal(type, "MESSAGE_DELETE_BULK")) {
 
 		const gchar *channel_id_s = json_object_get_string_member(data, "channel_id");
@@ -4449,6 +6059,13 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 		guint bulk_len = bulk_ids ? json_array_get_length(bulk_ids) : 0;
 
 		if (purple_strequal(type, "MESSAGE_DELETE_BULK") && bulk_len == 0) {
+			return;
+		}
+
+		if (da->native_meta && discord_native_deleted(da, channel_id_s,
+		        purple_strequal(type, "MESSAGE_DELETE_BULK") ? bulk_ids : NULL,
+		        json_object_get_string_member(data, "id"))) {
+			/* The UI marked them deleted */
 			return;
 		}
 
@@ -5141,6 +6758,11 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 
 	} else if (purple_strequal(type, "MESSAGE_REACTION_ADD") && purple_account_get_bool(da->account, "show-reactions", TRUE)) {
 
+		if (da->native_meta && discord_native_reaction(da, data, TRUE)) {
+			/* The UI shows it on the message */
+			return;
+		}
+
 		const gchar *channel_id_s = json_object_get_string_member(data, "channel_id");
 		guint64 channel_id = to_int(channel_id_s);
 		guint64 message_id = to_int(json_object_get_string_member(data, "message_id"));
@@ -5170,6 +6792,11 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 
 
 	} else if (purple_strequal(type, "MESSAGE_REACTION_REMOVE") && purple_account_get_bool(da->account, "show-reactions", TRUE)) {
+
+		if (da->native_meta && discord_native_reaction(da, data, FALSE)) {
+			/* The UI shows it on the message */
+			return;
+		}
 
 		const gchar *channel_id_s = json_object_get_string_member(data, "channel_id");
 		guint64 channel_id = to_int(channel_id_s);
@@ -5793,7 +7420,7 @@ discord_got_presences(DiscordAccount *da, JsonNode *node, gpointer user_data)
 			game_name = json_object_get_string_member(game, "state");
 		}
 
-		purple_protocol_got_user_status(da->account, merged_username, status, "message", game_name, NULL);
+		discord_got_user_status(da, merged_username, status, game_name, presence);
 		purple_protocol_got_user_idle(da->account, merged_username, purple_strequal(status, "idle"), 0);
 
 		g_free(merged_username);
@@ -6401,6 +8028,7 @@ discord_login(PurpleAccount *account)
 	da->pc = pc;
 	da->cookie_table = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 	da->http_keepalive_pool = purple_http_keepalive_pool_new();
+	discord_native_init(da);
 
 	da->last_load_last_message_id = (guint64) purple_account_get_int(account, "last_message_id_high", 0);
 
@@ -6579,6 +8207,7 @@ discord_close(PurpleConnection *pc)
 	da->session_id = NULL;
 	g_free(da->self_username);
 	da->self_username = NULL;
+	discord_native_free(da);
 	g_free(da);
 }
 
@@ -7533,7 +9162,7 @@ discord_thread_parent_cb(DiscordAccount *da, JsonNode *node, gpointer user_data)
 	gchar *old_id = g_strdup(json_object_get_string_member(message, "channel_id"));
 	json_object_set_string_member(message, "channel_id", thread_id);
 
-	discord_process_message(da, message, DISCORD_MESSAGE_NORMAL);
+	discord_process_message(da, message, DISCORD_MESSAGE_CONTEXT);
 
 	json_object_set_string_member(message, "channel_id", old_id);
 	g_free(old_id);
@@ -8624,6 +10253,38 @@ discord_mark_room_messages_read(DiscordAccount *da, guint64 channel_id)
 	g_free(url);
 }
 
+/* Acks @msg_id in @channel_id (native_meta: send-marker). FALSE if it was
+ * read already. */
+static gboolean
+discord_native_ack_message(DiscordAccount *da, guint64 channel_id, guint64 msg_id)
+{
+	JsonObject *ack;
+	gchar *url, *postdata;
+
+	if (!discord_native_read_set(da, channel_id, msg_id)) {
+		return FALSE;
+	}
+
+	/* As the conversation-updated ack does: history fetches start here */
+	discord_set_room_last_id(da, channel_id, msg_id);
+
+	url = g_strdup_printf("https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/channels/%" G_GUINT64_FORMAT "/messages/%" G_GUINT64_FORMAT "/ack", channel_id, msg_id);
+	ack = json_object_new();
+
+	if (da->ack_token) {
+		json_object_set_string_member(ack, "token", da->ack_token);
+	} else {
+		json_object_set_null_member(ack, "token");
+	}
+
+	postdata = json_object_to_string(ack);
+	json_object_unref(ack);
+	discord_fetch_url(da, url, postdata, discord_got_ack_token, NULL);
+	g_free(postdata);
+	g_free(url);
+	return TRUE;
+}
+
 static void
 discord_mark_conv_seen(PurpleConversation *conv, PurpleConversationUpdateType type)
 {
@@ -8645,6 +10306,12 @@ discord_mark_conv_seen(PurpleConversation *conv, PurpleConversationUpdateType ty
 	}
 
 	da = purple_connection_get_protocol_data(pc);
+
+	if (da->native_meta) {
+		/* The UI acks what it has shown with send-marker */
+		return;
+	}
+
 	guint64 room_id = discord_get_channel_id_from_conv(da, conv);
 
 	if (room_id != 0) {
@@ -8816,8 +10483,70 @@ discord_replace_natural_emoji(const GMatchInfo *match, GString *result, gpointer
 	return FALSE;
 }
 
+/* A send whose echo is held back until the server has assigned the id
+ * (native_meta): the gateway's MESSAGE_CREATE, or the REST reply, whichever
+ * comes first, shows it */
+typedef struct {
+	guint64 room_id;
+	gchar *nonce;
+} DiscordNativeSend;
+
 static void
-discord_conversation_send_image(DiscordAccount *da, guint64 room_id, PurpleImage *image)
+discord_native_sent_cb(DiscordAccount *da, JsonNode *node, gpointer user_data)
+{
+	DiscordNativeSend *send = user_data;
+	JsonObject *result = (node != NULL && JSON_NODE_HOLDS_OBJECT(node)) ? json_node_get_object(node) : NULL;
+
+	if (da->deferred_echo == NULL || !g_hash_table_contains(da->deferred_echo, send->nonce)) {
+		/* The gateway echo was first and showed it */
+
+	} else if (result != NULL && json_object_get_string_member(result, "id") != NULL &&
+	           json_object_get_object_member(result, "author") != NULL) {
+		/* Show it from the reply; the UI drops the gateway echo (same id) */
+		if (!json_object_has_member(result, "nonce")) {
+			json_object_set_string_member(result, "nonce", send->nonce);
+		}
+
+		discord_process_message(da, result, DISCORD_MESSAGE_NORMAL);
+
+	} else {
+		const gchar *error = result ? json_object_get_string_member(result, "message") : NULL;
+		gboolean is_chat;
+		gchar *conv_name = discord_native_conv_name(da, send->room_id, &is_chat);
+		PurpleConversation *conv = purple_find_conversation_with_account(
+			is_chat ? PURPLE_CONV_TYPE_CHAT : PURPLE_CONV_TYPE_IM, conv_name, da->account);
+		gchar *text = g_strdup_printf(_("Unable to send message: %s"),
+		                              error ? error : _("the server didn't accept it"));
+
+		g_hash_table_remove(da->deferred_echo, send->nonce);
+		g_hash_table_remove(da->sent_message_ids, send->nonce);
+
+		if (conv != NULL) {
+			purple_conversation_write(conv, NULL, text, PURPLE_MESSAGE_ERROR, time(NULL));
+		}
+
+		g_free(text);
+		g_free(conv_name);
+	}
+
+	g_free(send->nonce);
+	g_free(send);
+}
+
+static DiscordNativeSend *
+discord_native_send_new(DiscordAccount *da, guint64 room_id, const gchar *nonce)
+{
+	DiscordNativeSend *send = g_new0(DiscordNativeSend, 1);
+
+	send->room_id = room_id;
+	send->nonce = g_strdup(nonce);
+	g_hash_table_add(da->deferred_echo, g_strdup(nonce));
+
+	return send;
+}
+
+static void
+discord_conversation_send_image(DiscordAccount *da, guint64 room_id, PurpleImage *image, gboolean deferred_echo)
 {
 	GString *postdata;
 	gchar *filename;
@@ -8846,7 +10575,12 @@ discord_conversation_send_image(DiscordAccount *da, guint64 room_id, PurpleImage
 
 	url = g_strdup_printf("https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/channels/%" G_GUINT64_FORMAT "/messages", room_id);
 
-	discord_fetch_url_with_method_len(da, "POST", url, postdata->str, postdata->len, NULL, NULL);
+	if (deferred_echo) {
+		discord_fetch_url_with_method_len(da, "POST", url, postdata->str, postdata->len,
+		                                  discord_native_sent_cb, discord_native_send_new(da, room_id, nonce));
+	} else {
+		discord_fetch_url_with_method_len(da, "POST", url, postdata->str, postdata->len, NULL, NULL);
+	}
 
 	g_free(mimetype);
 	g_free(url);
@@ -8854,7 +10588,7 @@ discord_conversation_send_image(DiscordAccount *da, guint64 room_id, PurpleImage
 }
 
 static void
-discord_conversation_check_message_for_images(DiscordAccount *da, guint64 room_id, const gchar *message)
+discord_conversation_check_message_for_images(DiscordAccount *da, guint64 room_id, const gchar *message, gboolean deferred_echo)
 {
 	const gchar *img;
 
@@ -8868,7 +10602,7 @@ discord_conversation_check_message_for_images(DiscordAccount *da, guint64 room_i
 			PurpleImage *image = purple_image_store_get(imgid);
 
 			if (image != NULL) {
-				discord_conversation_send_image(da, room_id, image);
+				discord_conversation_send_image(da, room_id, image, deferred_echo);
 			}
 		} else if (((src = strstr(img, "SRC=\"")) || (src = strstr(img, "src=\""))) &&
 				src < close) {
@@ -8878,15 +10612,17 @@ discord_conversation_check_message_for_images(DiscordAccount *da, guint64 room_i
 				PurpleImage *image = purple_image_store_get(imgid);
 
 				if (image != NULL) {
-					discord_conversation_send_image(da, room_id, image);
+					discord_conversation_send_image(da, room_id, image, deferred_echo);
 				}
 			}
 		}
 	}
 }
 
+/* deferred_echo (native_meta only): the caller writes nothing; the message is
+ * shown when the server echoes it, with its id */
 static gint
-discord_conversation_send_message(DiscordAccount *da, guint64 room_id, const gchar *message, const gchar *ref_id)
+discord_conversation_send_message_full(DiscordAccount *da, guint64 room_id, const gchar *message, const gchar *ref_id, gboolean deferred_echo)
 {
 	JsonObject *data = json_object_new();
 	gchar *nonce;
@@ -8895,7 +10631,7 @@ discord_conversation_send_message(DiscordAccount *da, guint64 room_id, const gch
 	gchar *final;
 	gint final_len;
 
-	discord_conversation_check_message_for_images(da, room_id, message);
+	discord_conversation_check_message_for_images(da, room_id, message, deferred_echo);
 
 	nonce = g_strdup_printf("%" G_GUINT32_FORMAT, g_random_int());
 
@@ -8929,7 +10665,11 @@ discord_conversation_send_message(DiscordAccount *da, guint64 room_id, const gch
 		url = g_strdup_printf("https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/channels/%" G_GUINT64_FORMAT "/messages", room_id);
 		postdata = json_object_to_string(data);
 
-		discord_fetch_url(da, url, postdata, NULL, NULL);
+		if (deferred_echo) {
+			discord_fetch_url(da, url, postdata, discord_native_sent_cb, discord_native_send_new(da, room_id, nonce));
+		} else {
+			discord_fetch_url(da, url, postdata, NULL, NULL);
+		}
 
 		g_free(postdata);
 		g_free(url);
@@ -8945,6 +10685,12 @@ discord_conversation_send_message(DiscordAccount *da, guint64 room_id, const gch
 	}
 
 	return 1;
+}
+
+static gint
+discord_conversation_send_message(DiscordAccount *da, guint64 room_id, const gchar *message, const gchar *ref_id)
+{
+	return discord_conversation_send_message_full(da, room_id, message, ref_id, FALSE);
 }
 
 static gint
@@ -8985,9 +10731,10 @@ discord_chat_send(PurpleConnection *pc, gint id,
 	}
 
 	g_return_val_if_fail(discord_get_channel_global_int(da, room_id), -1); /* TODO rejoin room? */
-	ret = discord_conversation_send_message(da, room_id, d_message, NULL);
+	ret = discord_conversation_send_message_full(da, room_id, d_message, NULL, da->native_meta);
 
-	if (ret > 0) {
+	/* Native: shown when the server echoes it, with its id */
+	if (ret > 0 && !da->native_meta) {
 		gchar *tmp = g_regex_replace_eval(emoji_regex, d_message, -1, 0, 0, discord_replace_emoji, PURPLE_CONVERSATION(chatconv), NULL);
 
 		if (tmp != NULL) {
@@ -9049,7 +10796,7 @@ discord_created_direct_message_send(DiscordAccount *da, JsonNode *node, gpointer
 	}
 
 	if (room_id != NULL) {
-		discord_conversation_send_message(da, to_int(room_id), message, NULL);
+		discord_conversation_send_message_full(da, to_int(room_id), message, NULL, da->native_meta);
 	} else {
 		purple_conversation_present_error(who, da->account, _("Invalid channel for this user"));
 	}
@@ -9089,7 +10836,8 @@ discord_send_im(PurpleConnection *pc,
 			g_free(postdata);
 			json_object_unref(data);
 
-			return 1;
+			/* Native: shown when the server echoes it, with its id */
+			return da->native_meta ? 0 : 1;
 		}
 
 #if !PURPLE_VERSION_CHECK(3, 0, 0)
@@ -9097,6 +10845,14 @@ discord_send_im(PurpleConnection *pc,
 #endif
 		purple_conversation_present_error(who, da->account, _("Cannot send a message to someone who is not on your friend list."));
 		return -1;
+	}
+
+	if (da->native_meta) {
+		/* libpurple writes nothing for 0: the message is shown when the
+		 * server echoes it, with its id */
+		gint ret = discord_conversation_send_message_full(da, to_int(room_id), message, NULL, TRUE);
+
+		return ret > 0 ? 0 : ret;
 	}
 
 	return discord_conversation_send_message(da, to_int(room_id), message, NULL);
@@ -9492,29 +11248,49 @@ discord_list_icon(PurpleAccount *account, PurpleBuddy *buddy)
 	return "discord";
 }
 
+/* A status type with the "message" attribute and, with @game, "game" and
+ * "game_app_id" (see discord_got_user_status()) */
+static PurpleStatusType *
+discord_status_type_new(PurpleStatusPrimitive primitive, const gchar *id, const gchar *name,
+                        gboolean user_settable, gboolean independent, gboolean game)
+{
+	if (game) {
+		return purple_status_type_new_with_attrs(primitive, id, name, TRUE, user_settable, independent,
+			"message", _("Playing"), purple_value_new(PURPLE_TYPE_STRING),
+			"game", _("Game"), purple_value_new(PURPLE_TYPE_STRING),
+			"game_app_id", _("Game ID"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	}
+
+	return purple_status_type_new_with_attrs(primitive, id, name, TRUE, user_settable, independent,
+		"message", _("Playing"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+}
+
 static GList *
 discord_status_types(PurpleAccount *account)
 {
 	GList *types = NULL;
 	PurpleStatusType *status;
+	GHashTable *ui_info = purple_core_get_ui_info();
+	/* A message-meta UI (pidgin4) also shows friends' games */
+	gboolean game = ui_info != NULL && purple_strequal(g_hash_table_lookup(ui_info, "message-meta"), "1");
 
 	/* Other people can have an in-game display */
-	status = purple_status_type_new_with_attrs(PURPLE_STATUS_AVAILABLE, "online", _("Online"), TRUE, TRUE, FALSE, "message", _("Playing"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	status = discord_status_type_new(PURPLE_STATUS_AVAILABLE, "online", _("Online"), TRUE, FALSE, game);
 	types = g_list_append(types, status);
 
-	status = purple_status_type_new_with_attrs(PURPLE_STATUS_AWAY, "idle", _("Idle"), TRUE, TRUE, FALSE, "message", _("Playing"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	status = discord_status_type_new(PURPLE_STATUS_AWAY, "idle", _("Idle"), TRUE, FALSE, game);
 	types = g_list_append(types, status);
 
-	status = purple_status_type_new_with_attrs(PURPLE_STATUS_UNAVAILABLE, "dnd", _("Do Not Disturb"), TRUE, TRUE, FALSE, "message", _("Playing"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	status = discord_status_type_new(PURPLE_STATUS_UNAVAILABLE, "dnd", _("Do Not Disturb"), TRUE, FALSE, game);
 	types = g_list_append(types, status);
 
 	status = purple_status_type_new_full(PURPLE_STATUS_INVISIBLE, "set-invisible", _("Invisible"), TRUE, TRUE, FALSE);
 	types = g_list_append(types, status);
 
-	status = purple_status_type_new_with_attrs(PURPLE_STATUS_OFFLINE, "offline", _("Offline"), TRUE, FALSE, FALSE, "message", _("Playing"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	status = discord_status_type_new(PURPLE_STATUS_OFFLINE, "offline", _("Offline"), FALSE, FALSE, game);
 	types = g_list_append(types, status);
 
-	status = purple_status_type_new_with_attrs(PURPLE_STATUS_MOBILE, "mobile", _("Mobile"), TRUE, FALSE, TRUE, "message", _("Playing"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	status = discord_status_type_new(PURPLE_STATUS_MOBILE, "mobile", _("Mobile"), FALSE, TRUE, game);
 	types = g_list_append(types, status);
 
 
@@ -9856,6 +11632,16 @@ discord_add_account_options(GList *account_options)
 
 	option = purple_account_option_bool_new(_("Fetch names for reactors to backlogged messages (can be spammy)"), "fetch-react-backlog", FALSE);
 	account_options = g_list_append(account_options, option);
+
+	{
+		/* Only a UI with native message metadata shows reactions on history messages */
+		GHashTable *ui_info = purple_core_get_ui_info();
+
+		if (ui_info != NULL && purple_strequal(g_hash_table_lookup(ui_info, "message-meta"), "1")) {
+			option = purple_account_option_int_new(_("Fetch who reacted to this many history messages (0 disables)"), "reaction_history_limit", 25);
+			account_options = g_list_append(account_options, option);
+		}
+	}
 
 	option = purple_account_option_bool_new(_("Fetch unread chat messages when account connects"), "fetch-unread-on-start", TRUE);
 	account_options = g_list_append(account_options, option);
@@ -11363,6 +13149,451 @@ plugin_unload(PurplePlugin *plugin, GError **error)
 /* Purple2 Plugin Load Functions */
 #if !PURPLE_VERSION_CHECK(3, 0, 0)
 
+/*
+ * IPC commands for UIs with native message metadata (pidgin4), the same
+ * ones the XMPP prpl offers:
+ *
+ *   gboolean send-correction (PurpleAccount *, const char *conv_name, const char *target_id, const char *new_body)
+ *   gboolean send-reaction   (PurpleAccount *, const char *conv_name, const char *target_id, const char *emoji_list)
+ *   gboolean send-retraction (PurpleAccount *, const char *conv_name, const char *target_id)
+ *   gboolean send-reply      (PurpleAccount *, const char *conv_name, const char *reply_to_id,
+ *                             const char *reply_to_jid, const char *quoted_text, const char *body)
+ *
+ * Bodies are plain text; ids are message snowflakes; emoji_list is our
+ * complete new set of reactions, space-separated (see
+ * discord_reaction_emoji_display()). They return FALSE unless the account is
+ * a connected Discord account on such a UI. Results come back through the
+ * gateway (MESSAGE_UPDATE, MESSAGE_REACTION_*, MESSAGE_DELETE, and the
+ * echo of the reply) like changes made in any other client.
+ *
+ * send-marker (below) acks the channel.
+ */
+
+static DiscordAccount *
+discord_ipc_account(PurpleAccount *account)
+{
+	PurpleConnection *pc;
+	DiscordAccount *da;
+
+	if (account == NULL || !purple_strequal(purple_account_get_protocol_id(account), DISCORD_PLUGIN_ID)) {
+		return NULL;
+	}
+
+	pc = purple_account_get_connection(account);
+
+	if (pc == NULL || !PURPLE_CONNECTION_IS_CONNECTED(pc)) {
+		return NULL;
+	}
+
+	da = purple_connection_get_protocol_data(pc);
+
+	return (da != NULL && da->native_meta) ? da : NULL;
+}
+
+/* The channel of conversation @conv_name, and its guild */
+static guint64
+discord_ipc_room(DiscordAccount *da, const gchar *conv_name, DiscordGuild **guild)
+{
+	PurpleConversation *conv;
+	guint64 room_id = 0;
+
+	if (conv_name == NULL || *conv_name == '\0') {
+		return 0;
+	}
+
+	conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_ANY, conv_name, da->account);
+
+	if (conv != NULL) {
+		room_id = discord_get_channel_id_from_conv(da, conv);
+	}
+
+	if (room_id == 0) {
+		const gchar *dm = g_hash_table_lookup(da->one_to_ones_rev, conv_name);
+
+		room_id = dm ? to_int(dm) : (str_is_number(conv_name) ? to_int(conv_name) : 0);
+	}
+
+	if (room_id != 0 && guild != NULL) {
+		discord_get_channel_global_int_guild(da, room_id, guild);
+	}
+
+	return room_id;
+}
+
+/* The channel message @msg_id is in: a thread's own id for thread messages */
+static guint64
+discord_ipc_message_channel(DiscordAccount *da, guint64 room_id, const gchar *msg_id)
+{
+	DiscordMsgInfo *info = g_hash_table_lookup(da->msg_info, msg_id);
+
+	return (info != NULL && info->channel_id != 0) ? info->channel_id : room_id;
+}
+
+/* The UI's plain text as the HTML discord_conversation_send_message() takes,
+ * with mentions and custom emoji resolved as for typed messages */
+static gchar *
+discord_ipc_body_html(DiscordAccount *da, DiscordGuild *guild, const gchar *plain)
+{
+	gchar *esc = purple_markup_escape_text(plain, -1);
+	gchar *html = purple_strreplace(esc, "\n", "<br>");
+
+	g_free(esc);
+	html = discord_make_mentions(da, guild, html);
+
+	if (guild != NULL) {
+		gchar *tmp = g_regex_replace_eval(emoji_natural_regex, html, -1, 0, 0, discord_replace_natural_emoji, guild, NULL);
+
+		if (tmp != NULL) {
+			g_free(html);
+			html = tmp;
+		}
+	}
+
+	return html;
+}
+
+static gboolean
+discord_ipc_send_correction(PurpleAccount *account, const gchar *conv_name, const gchar *target_id, const gchar *new_body)
+{
+	DiscordAccount *da = discord_ipc_account(account);
+	DiscordGuild *guild = NULL;
+	guint64 room_id, msg_id = target_id ? to_int(target_id) : 0;
+	gchar *html, *marked, *stripped, *content;
+	gboolean ok = FALSE;
+
+	if (da == NULL || msg_id == 0 || new_body == NULL || (room_id = discord_ipc_room(da, conv_name, &guild)) == 0) {
+		return FALSE;
+	}
+
+	/* The same conversion as a sent message */
+	html = discord_ipc_body_html(da, guild, new_body);
+	marked = markdown_html_to_markdown(markdown_escape_md(html, TRUE));
+	stripped = g_strstrip(purple_markup_strip_html(marked));
+	content = purple_message_meify(stripped, -1) ? g_strdup_printf("_%s_", stripped) : g_strdup(stripped);
+
+	if (*content != '\0' && strlen(content) <= 2000) {
+		JsonObject *data = json_object_new();
+		gchar *postdata, *url;
+
+		json_object_set_string_member(data, "content", content);
+		postdata = json_object_to_string(data);
+		url = g_strdup_printf("https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/channels/%" G_GUINT64_FORMAT "/messages/%" G_GUINT64_FORMAT,
+		                      discord_ipc_message_channel(da, room_id, target_id), msg_id);
+		discord_fetch_url_with_method(da, "PATCH", url, postdata, NULL, NULL);
+		ok = TRUE;
+
+		g_free(url);
+		g_free(postdata);
+		json_object_unref(data);
+	}
+
+	g_free(content);
+	g_free(stripped);
+	g_free(marked);
+	g_free(html);
+	return ok;
+}
+
+static gboolean
+discord_ipc_send_reaction(PurpleAccount *account, const gchar *conv_name, const gchar *target_id, const gchar *emoji_list)
+{
+	DiscordAccount *da = discord_ipc_account(account);
+	DiscordGuild *guild = NULL;
+	guint64 room_id, channel_id, msg_id = target_id ? to_int(target_id) : 0;
+	GPtrArray *wanted, *to_add, *to_remove;
+	gchar **parts;
+	guint i;
+
+	if (da == NULL || msg_id == 0 || (room_id = discord_ipc_room(da, conv_name, &guild)) == 0) {
+		return FALSE;
+	}
+
+	channel_id = discord_ipc_message_channel(da, room_id, target_id);
+	wanted = g_ptr_array_new_with_free_func(g_free);
+	to_add = g_ptr_array_new_with_free_func(g_free);
+	to_remove = g_ptr_array_new_with_free_func(g_free);
+	parts = g_strsplit_set(emoji_list ? emoji_list : "", " \t\n", -1);
+
+	for (i = 0; parts[i] != NULL; i++) {
+		gchar *api;
+
+		if (*parts[i] == '\0') {
+			continue;
+		}
+
+		api = discord_reaction_emoji_to_api(da, guild, parts[i]);
+
+		if (api != NULL) {
+			g_ptr_array_add(wanted, api);
+		} else {
+			purple_debug_warning("discord", "Can't react with unknown custom emoji %s\n", parts[i]);
+		}
+	}
+
+	discord_reaction_diff(g_hash_table_lookup(da->own_reactions, target_id), wanted, to_add, to_remove);
+
+	for (i = 0; i < to_remove->len + to_add->len; i++) {
+		gboolean add = i >= to_remove->len;
+		const gchar *emoji = add ? g_ptr_array_index(to_add, i - to_remove->len) : g_ptr_array_index(to_remove, i);
+		gchar *url = g_strdup_printf("https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/channels/%" G_GUINT64_FORMAT "/messages/%" G_GUINT64_FORMAT "/reactions/%s/%%40me",
+		                             channel_id, msg_id, purple_url_encode(emoji));
+
+		discord_fetch_url_with_method(da, add ? "PUT" : "DELETE", url, add ? "{}" : NULL, NULL, NULL);
+		/* Right away, so a quick second change diffs against this one */
+		discord_own_reactions_update(da, target_id, emoji, add);
+		g_free(url);
+	}
+
+	g_strfreev(parts);
+	g_ptr_array_free(to_remove, TRUE);
+	g_ptr_array_free(to_add, TRUE);
+	g_ptr_array_free(wanted, TRUE);
+	return TRUE;
+}
+
+static gboolean
+discord_ipc_send_retraction(PurpleAccount *account, const gchar *conv_name, const gchar *target_id)
+{
+	DiscordAccount *da = discord_ipc_account(account);
+	guint64 room_id, msg_id = target_id ? to_int(target_id) : 0;
+	gchar *url;
+
+	if (da == NULL || msg_id == 0 || (room_id = discord_ipc_room(da, conv_name, NULL)) == 0) {
+		return FALSE;
+	}
+
+	url = g_strdup_printf("https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/channels/%" G_GUINT64_FORMAT "/messages/%" G_GUINT64_FORMAT,
+	                      discord_ipc_message_channel(da, room_id, target_id), msg_id);
+	discord_fetch_url_with_method(da, "DELETE", url, NULL, NULL, NULL);
+	g_free(url);
+	return TRUE;
+}
+
+static gboolean
+discord_ipc_send_reply(PurpleAccount *account, const gchar *conv_name, const gchar *reply_to_id,
+                       const gchar *reply_to_jid, const gchar *quoted_text, const gchar *body)
+{
+	DiscordAccount *da = discord_ipc_account(account);
+	DiscordGuild *guild = NULL;
+	guint64 room_id, msg_id = reply_to_id ? to_int(reply_to_id) : 0;
+	gchar *html, *ref_id;
+	gint ret;
+
+	/* reply_to_jid and quoted_text aren't needed: Discord shows the reply */
+	if (da == NULL || msg_id == 0 || body == NULL || *body == '\0' ||
+	    (room_id = discord_ipc_room(da, conv_name, &guild)) == 0) {
+		return FALSE;
+	}
+
+	html = discord_ipc_body_html(da, guild, body);
+	ref_id = from_int(msg_id);
+	/* Shown when the server echoes it, with the reply-to */
+	ret = discord_conversation_send_message_full(da, discord_ipc_message_channel(da, room_id, reply_to_id),
+	                                             html, ref_id, TRUE);
+	g_free(ref_id);
+	g_free(html);
+	return ret > 0;
+}
+
+/* The plugin, for its own signal (mam-query-done) */
+static PurplePlugin *discord_plugin_handle = NULL;
+
+typedef struct {
+	PurpleAccount *account;
+	gchar *conv_name;
+	guint count;
+} DiscordOlderQuery;
+
+/*
+ * A mam-fetch-older page (newest first, as the API returns it): shown
+ * oldest first through the usual path, as PURPLE_MESSAGE_DELAYED with
+ * "mam" = "1" and "mam-query" = "older", then
+ * mam-query-done(account, conv_name, first_id, last_id, complete) on the
+ * plugin. first_id is the oldest message (the next page's before_id);
+ * complete says there is nothing older. A failed request ends the query
+ * with no ids.
+ */
+static void
+discord_native_older_cb(DiscordAccount *da, JsonNode *node, gpointer user_data)
+{
+	DiscordOlderQuery *query = user_data;
+	JsonArray *messages = (node != NULL && JSON_NODE_HOLDS_ARRAY(node)) ? json_node_get_array(node) : NULL;
+	guint len = messages ? json_array_get_length(messages) : 0;
+	const gchar *first_id = NULL, *last_id = NULL;
+	gint i;
+
+	if (len > 0) {
+		first_id = json_object_get_string_member(json_array_get_object_element(messages, len - 1), "id");
+		last_id = json_object_get_string_member(json_array_get_object_element(messages, 0), "id");
+		da->history_older = TRUE;
+
+		for (i = len - 1; i >= 0; i--) {
+			discord_process_message(da, json_array_get_object_element(messages, i), DISCORD_MESSAGE_NORMAL);
+		}
+
+		da->history_older = FALSE;
+	}
+
+	purple_debug_info("discord", "Scroll-back page for %s: %u messages\n", query->conv_name, len);
+
+	if (discord_plugin_handle != NULL) {
+		purple_signal_emit(discord_plugin_handle, "mam-query-done", query->account, query->conv_name,
+		                   first_id, last_id, (guint) (messages != NULL && len < query->count));
+	}
+
+	g_free(query->conv_name);
+	g_free(query);
+}
+
+/*
+ * gboolean mam-fetch-older(PurpleAccount *, const char *conv_name, const char *before_id, guint count)
+ *
+ * Scroll-back: fetches up to @count (1-100) messages before @before_id
+ * (NULL or "": the newest ones) in the conversation's channel (a guild
+ * channel, DM or group DM) with GET /channels/{id}/messages, and shows them
+ * as discord_native_older_cb() describes.
+ */
+static gboolean
+discord_ipc_mam_fetch_older(PurpleAccount *account, const gchar *conv_name, const gchar *before_id, guint count)
+{
+	DiscordAccount *da = discord_ipc_account(account);
+	DiscordOlderQuery *query;
+	guint64 room_id, before = 0;
+	gchar *url;
+
+	if (da == NULL || discord_plugin_handle == NULL || (room_id = discord_ipc_room(da, conv_name, NULL)) == 0) {
+		return FALSE;
+	}
+
+	if (before_id != NULL && *before_id != '\0' && (before = to_int(before_id)) == 0) {
+		return FALSE;
+	}
+
+	count = CLAMP(count, 1, 100);
+	query = g_new0(DiscordOlderQuery, 1);
+	query->account = account;
+	query->conv_name = g_strdup(conv_name);
+	query->count = count;
+
+	if (before != 0) {
+		url = g_strdup_printf("https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/channels/%" G_GUINT64_FORMAT "/messages?limit=%u&before=%" G_GUINT64_FORMAT, room_id, count, before);
+	} else {
+		url = g_strdup_printf("https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/channels/%" G_GUINT64_FORMAT "/messages?limit=%u", room_id, count);
+	}
+
+	discord_fetch_url(da, url, NULL, discord_native_older_cb, query);
+	g_free(url);
+	return TRUE;
+}
+
+/*
+ * gboolean send-marker(PurpleAccount *, const char *conv_name, const char *message_id, const char *marker)
+ *
+ * The UI has shown everything up to @message_id: acks it
+ * (POST /channels/{id}/messages/{id}/ack), unless that channel is known to
+ * be read that far (acked before, or MESSAGE_ACK from another client).
+ * @marker is "displayed" (NULL or "" too) or "acknowledged"; Discord has no
+ * "received". With a message-meta UI this replaces the ack on the
+ * conversation's unseen update, so each read is acked once.
+ */
+static gboolean
+discord_ipc_send_marker(PurpleAccount *account, const gchar *conv_name, const gchar *message_id, const gchar *marker)
+{
+	DiscordAccount *da = discord_ipc_account(account);
+	guint64 room_id, msg_id = message_id ? to_int(message_id) : 0;
+
+	if (da == NULL || msg_id == 0 || (room_id = discord_ipc_room(da, conv_name, NULL)) == 0) {
+		return FALSE;
+	}
+
+	if (marker != NULL && *marker != '\0' && !purple_strequal(marker, "displayed") &&
+	    !purple_strequal(marker, "acknowledged")) {
+		return FALSE;
+	}
+
+	discord_native_ack_message(da, discord_ipc_message_channel(da, room_id, message_id), msg_id);
+	return TRUE;
+}
+
+static void
+discord_ipc_register(PurplePlugin *plugin)
+{
+	purple_plugin_ipc_register(plugin, "send-correction",
+			PURPLE_CALLBACK(discord_ipc_send_correction),
+			purple_marshal_BOOLEAN__POINTER_POINTER_POINTER_POINTER,
+			purple_value_new(PURPLE_TYPE_BOOLEAN), 4,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+
+	purple_plugin_ipc_register(plugin, "send-reaction",
+			PURPLE_CALLBACK(discord_ipc_send_reaction),
+			purple_marshal_BOOLEAN__POINTER_POINTER_POINTER_POINTER,
+			purple_value_new(PURPLE_TYPE_BOOLEAN), 4,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+
+	purple_plugin_ipc_register(plugin, "send-retraction",
+			PURPLE_CALLBACK(discord_ipc_send_retraction),
+			purple_marshal_BOOLEAN__POINTER_POINTER_POINTER,
+			purple_value_new(PURPLE_TYPE_BOOLEAN), 3,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+
+	purple_plugin_ipc_register(plugin, "send-reply",
+			PURPLE_CALLBACK(discord_ipc_send_reply),
+			purple_marshal_BOOLEAN__POINTER_POINTER_POINTER_POINTER_POINTER_POINTER,
+			purple_value_new(PURPLE_TYPE_BOOLEAN), 6,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+
+	purple_plugin_ipc_register(plugin, "send-marker",
+			PURPLE_CALLBACK(discord_ipc_send_marker),
+			purple_marshal_BOOLEAN__POINTER_POINTER_POINTER_POINTER,
+			purple_value_new(PURPLE_TYPE_BOOLEAN), 4,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+
+	purple_plugin_ipc_register(plugin, "mam-fetch-older",
+			PURPLE_CALLBACK(discord_ipc_mam_fetch_older),
+			purple_marshal_BOOLEAN__POINTER_POINTER_POINTER_UINT,
+			purple_value_new(PURPLE_TYPE_BOOLEAN), 4,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_UINT));
+
+	purple_debug_info("discord", "Registered IPC commands send-correction, send-reaction, "
+	                  "send-retraction, send-reply, send-marker and mam-fetch-older\n");
+
+	/* The end of a scroll-back page; only a message-meta UI listens */
+	{
+		GHashTable *ui_info = purple_core_get_ui_info();
+
+		if (ui_info != NULL && purple_strequal(g_hash_table_lookup(ui_info, "message-meta"), "1")) {
+			purple_signal_register(plugin, "mam-query-done",
+					purple_marshal_VOID__POINTER_POINTER_POINTER_POINTER_UINT,
+					NULL, 5,
+					purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+					purple_value_new(PURPLE_TYPE_STRING),
+					purple_value_new(PURPLE_TYPE_STRING),
+					purple_value_new(PURPLE_TYPE_STRING),
+					purple_value_new(PURPLE_TYPE_BOOLEAN));
+			discord_plugin_handle = plugin;
+			purple_debug_info("discord", "Registered signal mam-query-done\n");
+		}
+	}
+}
 
 // Normally set in core.c in purple3
 void _purple_socket_init(void);
@@ -11374,7 +13605,12 @@ libpurple2_plugin_load(PurplePlugin *plugin)
 	_purple_socket_init();
 	purple_http_init();
 
-	return plugin_load(plugin, NULL);
+	if (!plugin_load(plugin, NULL)) {
+		return FALSE;
+	}
+
+	discord_ipc_register(plugin);
+	return TRUE;
 }
 
 static gboolean
@@ -11382,6 +13618,11 @@ libpurple2_plugin_unload(PurplePlugin *plugin)
 {
 	_purple_socket_uninit();
 	purple_http_uninit();
+	purple_plugin_ipc_unregister_all(plugin);
+	if (discord_plugin_handle != NULL) {
+		purple_signal_unregister(plugin, "mam-query-done");
+		discord_plugin_handle = NULL;
+	}
 
 	return plugin_unload(plugin, NULL);
 }
