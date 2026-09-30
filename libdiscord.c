@@ -8028,6 +8028,8 @@ discord_login(PurpleAccount *account)
 	da->pc = pc;
 	da->cookie_table = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 	da->http_keepalive_pool = purple_http_keepalive_pool_new();
+	/* Bound the REST connections per host; excess requests queue in order */
+	purple_http_keepalive_pool_set_limit_per_host(da->http_keepalive_pool, 6);
 	discord_native_init(da);
 
 	da->last_load_last_message_id = (guint64) purple_account_get_int(account, "last_message_id_high", 0);

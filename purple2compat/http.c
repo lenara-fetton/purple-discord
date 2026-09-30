@@ -52,6 +52,9 @@
 
 #define PURPLE_HTTP_PROGRESS_WATCHER_DEFAULT_INTERVAL 250000
 
+/* seconds an unused keep-alive socket is kept open in the pool */
+#define PURPLE_HTTP_KEEPALIVE_IDLE_TIMEOUT 60
+
 typedef struct _PurpleHttpSocket PurpleHttpSocket;
 
 typedef struct _PurpleHttpHeaders PurpleHttpHeaders;
@@ -69,6 +72,7 @@ struct _PurpleHttpSocket
 	gboolean is_busy;
 	guint use_count;
 	PurpleHttpKeepaliveHost *host;
+	guint idle_timeout;
 };
 
 struct _PurpleHttpRequest
@@ -505,6 +509,10 @@ purple_http_socket_close_free(PurpleHttpSocket *hs)
 
 	if (purple_debug_is_verbose())
 		purple_debug_misc("http", "destroying socket: %p\n", hs);
+
+	if (hs->idle_timeout > 0)
+		purple_timeout_remove(hs->idle_timeout);
+	hs->idle_timeout = 0;
 
 	purple_socket_destroy(hs->ps);
 	g_free(hs);
@@ -2260,6 +2268,79 @@ _purple_http_keepalive_socket_connected(PurpleSocket *ps,
 	g_free(req);
 }
 
+static void
+_purple_http_keepalive_socket_idle_close(PurpleHttpSocket *hs,
+	const gchar *reason)
+{
+	PurpleHttpKeepaliveHost *host = hs->host;
+
+	purple_debug_misc("http", "closing idle keep-alive socket %p: %s\n",
+		hs, reason);
+
+	host->sockets = g_slist_remove(host->sockets, hs);
+	purple_http_socket_close_free(hs);
+
+	purple_http_keepalive_host_process_queue(host);
+}
+
+static void
+_purple_http_keepalive_socket_idle_read(gpointer _hs, gint fd,
+	PurpleInputCondition cond)
+{
+	PurpleHttpSocket *hs = _hs;
+	guchar buf[256];
+	gssize len;
+
+	g_return_if_fail(!hs->is_busy);
+
+	/* Nothing is expected on an idle socket. Reading lets the TLS layer
+	 * consume handshake messages (e.g. session tickets), anything else
+	 * means the server closed the connection or it is unusable. */
+	len = purple_socket_read(hs->ps, buf, sizeof(buf));
+
+	if (len < 0 && errno == EAGAIN)
+		return;
+
+	if (len == 0)
+		_purple_http_keepalive_socket_idle_close(hs, "closed by server");
+	else if (len < 0)
+		_purple_http_keepalive_socket_idle_close(hs, g_strerror(errno));
+	else
+		_purple_http_keepalive_socket_idle_close(hs, "unexpected data");
+}
+
+static gboolean
+_purple_http_keepalive_socket_idle_timeout(gpointer _hs)
+{
+	PurpleHttpSocket *hs = _hs;
+
+	hs->idle_timeout = 0;
+	_purple_http_keepalive_socket_idle_close(hs, "idle timeout");
+
+	return FALSE;
+}
+
+/* Watches a pooled socket while no request uses it, so it is closed as soon
+ * as the server drops it instead of lingering in CLOSE-WAIT. */
+static void
+purple_http_keepalive_socket_set_idle(PurpleHttpSocket *hs, gboolean is_idle)
+{
+	if (hs->idle_timeout > 0)
+		purple_timeout_remove(hs->idle_timeout);
+	hs->idle_timeout = 0;
+
+	purple_socket_watch(hs->ps, 0, NULL, NULL);
+
+	if (!is_idle)
+		return;
+
+	purple_socket_watch(hs->ps, PURPLE_INPUT_READ,
+		_purple_http_keepalive_socket_idle_read, hs);
+	hs->idle_timeout = purple_timeout_add_seconds(
+		PURPLE_HTTP_KEEPALIVE_IDLE_TIMEOUT,
+		_purple_http_keepalive_socket_idle_timeout, hs);
+}
+
 static gboolean
 _purple_http_keepalive_host_process_queue_cb(gpointer _host)
 {
@@ -2307,6 +2388,7 @@ _purple_http_keepalive_host_process_queue_cb(gpointer _host)
 				"socket: %p\n", hs);
 		}
 
+		purple_http_keepalive_socket_set_idle(hs, FALSE);
 		hs->is_busy = TRUE;
 		hs->use_count++;
 
@@ -2322,7 +2404,10 @@ _purple_http_keepalive_host_process_queue_cb(gpointer _host)
 		req->host->port, req->host->is_ssl,
 		_purple_http_keepalive_socket_connected, req);
 	if (hs == NULL) {
-		purple_debug_error("http", "failed creating new socket");
+		purple_debug_error("http", "failed creating new socket\n");
+		purple_http_keepalive_host_process_queue(host);
+		req->cb(NULL, _("Unable to connect"), req->user_data);
+		g_free(req);
 		return FALSE;
 	}
 
@@ -2334,6 +2419,9 @@ _purple_http_keepalive_host_process_queue_cb(gpointer _host)
 		purple_debug_misc("http", "locking a (new) socket: %p\n", hs);
 
 	host->sockets = g_slist_append(host->sockets, hs);
+
+	/* the rest of the queue may fit into other sockets (up to the limit) */
+	purple_http_keepalive_host_process_queue(host);
 
 	return FALSE;
 }
@@ -2395,7 +2483,8 @@ purple_http_keepalive_pool_release(PurpleHttpSocket *hs, gboolean invalidate)
 	if (invalidate) {
 		host->sockets = g_slist_remove(host->sockets, hs);
 		purple_http_socket_close_free(hs);
-	}
+	} else
+		purple_http_keepalive_socket_set_idle(hs, TRUE);
 
 	purple_http_keepalive_host_process_queue(host);
 }
