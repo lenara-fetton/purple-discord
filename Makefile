@@ -86,7 +86,7 @@ else
 endif
 
 WIN32_CFLAGS = -std=c99 -I$(WIN32_DEV_TOP)/glib-2.28.8/include -I$(WIN32_DEV_TOP)/glib-2.28.8/include/glib-2.0 -I$(WIN32_DEV_TOP)/glib-2.28.8/lib/glib-2.0/include -I$(WIN32_DEV_TOP)/json-glib-0.14/include/json-glib-1.0 -DENABLE_NLS -DDISCORD_PLUGIN_VERSION='"$(PLUGIN_VERSION)"' -DMARKDOWN_PIDGIN -Wall -Wextra -Werror -Wno-deprecated-declarations -Wno-unused-parameter -fno-strict-aliasing -Wformat
-WIN32_LDFLAGS = -L$(WIN32_DEV_TOP)/glib-2.28.8/lib -L$(WIN32_DEV_TOP)/json-glib-0.14/lib -lpurple -lintl -lglib-2.0 -lgobject-2.0 -lgio-2.0 -ljson-glib-1.0 -g -ggdb -static-libgcc -lz
+WIN32_LDFLAGS = -L$(WIN32_DEV_TOP)/glib-2.28.8/lib -L$(WIN32_DEV_TOP)/json-glib-0.14/lib -lpurple -lintl -lglib-2.0 -lgobject-2.0 -ljson-glib-1.0 -g -ggdb -static-libgcc -lz
 WIN32_PIDGIN2_CFLAGS = -I$(PIDGIN_TREE_TOP)/libpurple -I$(PIDGIN_TREE_TOP) $(WIN32_CFLAGS)
 WIN32_PIDGIN3_CFLAGS = -I$(PIDGIN3_TREE_TOP)/libpurple -I$(PIDGIN3_TREE_TOP) -I$(WIN32_DEV_TOP)/gplugin-dev/gplugin $(WIN32_CFLAGS)
 WIN32_PIDGIN2_LDFLAGS = -L$(PIDGIN_TREE_TOP)/libpurple $(WIN32_LDFLAGS)
@@ -97,14 +97,30 @@ ifneq ($(USE_QRCODE_AUTH), 0)
 	WIN32_LDFLAGS += -L$(WIN32_DEV_TOP)/nss-3.24-nspr-4.12/lib -L$(WIN32_DEV_TOP)/qrencode-4.1.1 -lnss3 -lqrencode
 	
 	ifneq ($(OS),Windows_NT)
-		CFLAGS += $(shell ${PKG_CONFIG} --cflags nss libqrencode) -DUSE_QRCODE_AUTH
-		LDFLAGS += $(shell ${PKG_CONFIG} --libs nss libqrencode)
+		ifeq ($(USE_OPENSSL_CRYPTO), 1)
+			CFLAGS += $(shell ${PKG_CONFIG} --cflags openssl libqrencode) -DUSE_QRCODE_AUTH -DUSE_OPENSSL_CRYPTO
+			LDFLAGS += $(shell ${PKG_CONFIG} --libs openssl libqrencode)
+		else
+			CFLAGS += $(shell ${PKG_CONFIG} --cflags nss libqrencode) -DUSE_QRCODE_AUTH
+			LDFLAGS += $(shell ${PKG_CONFIG} --libs nss libqrencode)
+		endif
 	endif
+endif
+
+ifneq ($(OS),Windows_NT)
+	LDFLAGS += -ldl
+endif
+
+ifeq ($(USE_RLOTTIE_STATIC), 1)
+	WIN32_CFLAGS += -DRLOTTIE_STATIC -I$(WIN32_DEV_TOP)/rlottie/inc
+	WIN32_LDFLAGS += -L$(WIN32_DEV_TOP)/rlottie -lrlottie -lshlwapi -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic
+	CFLAGS += -DRLOTTIE_STATIC
+	LDFLAGS += -lrlottie -lstdc++
 endif
 
 CFLAGS += -DLOCALEDIR=\"$(LOCALEDIR)\"
 
-C_FILES := markdown.c
+C_FILES := markdown.c discord_lottie.c
 PURPLE_COMPAT_FILES := purple2compat/*.c
 PURPLE_C_FILES := libdiscord.c $(C_FILES)
 
