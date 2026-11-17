@@ -52,6 +52,7 @@
 #include "purple_compat.h"
 
 #include "markdown.h"
+#include "discord_lottie.h"
 
 // Prevent segfault in libpurple ssl plugins
 #define purple_ssl_read(a, b, c)  ((a) && (a)->private_data ? purple_ssl_read((a), (b), (c)) : 0)
@@ -401,6 +402,8 @@ typedef struct {
 	gchar *token;
 	gchar *session_id;
 	gchar *mfa_ticket;
+	gchar *fingerprint;
+	gchar *login_instance_id;
 	gchar *ack_token;
 
 	PurpleSslConnection *websocket;
@@ -410,6 +413,12 @@ typedef struct {
 	gchar *frame;
 	guint64 frame_len;
 	guint64 frame_len_progress;
+	GByteArray *frame_fragments;	/* payload so far of a message sent in several frames */
+	guint websocket_status_len;
+	guint frame_header_len;
+	gchar websocket_status[13];	/* start of the handshake reply's status line */
+	guchar frame_header[10];	/* frame header bytes read so far */
+	guchar websocket_header_nlbr;	/* run of CR/LF at the end of the handshake reply read so far */
 
 	gint64 seq; /* incrementing counter */
 	guint heartbeat_timeout;
@@ -495,6 +504,7 @@ typedef struct _DiscordImgMsgContext {
 	gint conv_id;
 	gchar *from;
 	gchar *url;
+	gchar *label;
 	PurpleMessageFlags flags;
 	time_t timestamp;
 } DiscordImgMsgContext;
@@ -790,6 +800,7 @@ discord_free_image_context(gpointer data)
 	DiscordImgMsgContext *img_context = data;
 	g_free(img_context->from);
 	g_free(img_context->url);
+	g_free(img_context->label);
 	g_free(img_context);
 }
 
@@ -869,6 +880,9 @@ discord_add_thread(DiscordAccount *da, DiscordGuild *guild, DiscordChannel *pare
 		parent = discord_get_channel_global(da, from_int(thread->parent_id));
 	}
 	if (parent) {
+		if (parent->threads == NULL) {
+			parent->threads = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, NULL);
+		}
 		g_hash_table_replace_int64(parent->threads, thread->id, thread);
 	}
 	return thread;
@@ -1512,13 +1526,6 @@ discord_escape_form_filename(const gchar *filename)
 	return g_string_free(ret, FALSE);
 }
 
-/* Requests whose bodies or responses carry passwords, MFA codes or tokens */
-static gboolean
-discord_url_is_sensitive(const gchar *url)
-{
-	return url != NULL && (strstr(url, "/auth/") != NULL || strstr(url, "/remote-auth") != NULL);
-}
-
 static gchar *
 discord_combine_username(const gchar *username, const gchar *discriminator)
 {
@@ -1678,6 +1685,115 @@ discord_native_note_rate_limit(DiscordAccount *da, const gchar *remaining, const
 	}
 }
 
+/* Keys whose string values are secrets: the account token, and what can be traded for one or for
+ * the account (a password, an MFA code, an MFA or remote-auth ticket, the encrypted token a QR login
+ * receives, a solved captcha). */
+static const gchar *const discord_secret_keys[] = {
+	"token", "encrypted_token", "password", "code", "ticket", "captcha_key", NULL
+};
+
+/* If a "key": "value" pair with a secret key starts at text[i] (the key's opening quote, written "
+ * or, inside a JSON-encoded string, \"), the offset of the value's first character, else 0. *quote
+ * is set to the quote's length (1 or 2). */
+static gsize
+discord_secret_value_at(const gchar *text, gsize len, gsize i, gsize *quote)
+{
+	gsize q = text[i] == '"' ? 1 : (text[i] == '\\' && i + 1 < len && text[i + 1] == '"') ? 2 : 0;
+
+	if (q == 0)
+		return 0;
+
+	for (const gchar *const *key = discord_secret_keys; *key != NULL; key++) {
+		gsize k = strlen(*key);
+		gsize j = i + q;
+
+		if (j + k + q > len || strncmp(text + j, *key, k) != 0 || strncmp(text + j + k, text + i, q) != 0)
+			continue;
+		j += k + q;
+		while (j < len && (text[j] == ' ' || text[j] == '\t'))
+			j++;
+		if (j >= len || text[j] != ':')
+			continue;
+		j++;
+		while (j < len && (text[j] == ' ' || text[j] == '\t'))
+			j++;
+		if (j + q > len || strncmp(text + j, text + i, q) != 0)
+			continue;
+
+		*quote = q;
+		return j + q;
+	}
+
+	return 0;
+}
+
+/* A copy of text (len bytes, or up to its NUL for -1) for the debug log, with the string value of
+ * every key in discord_secret_keys replaced by "<redacted>", also inside a JSON-encoded string
+ * (\"token\":\"...\"). */
+static gchar *
+discord_redact(const gchar *text, gssize len)
+{
+	if (text == NULL)
+		return NULL;
+
+	gsize n = len < 0 ? strlen(text) : (gsize) len;
+	GString *out = g_string_sized_new(n);
+	gsize i = 0;
+
+	while (i < n) {
+		gsize quote = 0;
+		gsize value = discord_secret_value_at(text, n, i, &quote);
+
+		if (value == 0) {
+			g_string_append_c(out, text[i]);
+			i++;
+			continue;
+		}
+
+		/* Up to the value's closing quote: a " that is not escaped, or, written \", the next \". */
+		gsize end = value;
+		while (end < n) {
+			if (quote == 1 && text[end] == '\\' && end + 1 < n) {
+				end += 2;
+			} else if (quote == 1 && text[end] == '"') {
+				break;
+			} else if (quote == 2 && text[end] == '\\' && end + 1 < n && text[end + 1] == '"') {
+				break;
+			} else {
+				end++;
+			}
+		}
+
+		g_string_append_len(out, text + i, value - i);
+		g_string_append(out, "<redacted>");
+		i = end;
+	}
+
+	return g_string_free(out, FALSE);
+}
+
+/* Whether a request to url carries a password, an MFA code or a remote-auth ticket, or answers
+ * with a token: Discord's /auth/ and remote-auth endpoints. */
+static gboolean
+discord_url_is_auth(const gchar *url)
+{
+	return url != NULL && (strstr(url, "/auth/") != NULL || strstr(url, "/remote-auth") != NULL);
+}
+
+/* Logs "<what>: <body>" (len bytes, or up to its NUL for -1) with the account token and other
+ * secrets masked. Nothing is done while debugging is off. */
+static void
+discord_debug_redacted(PurpleDebugLevel level, const gchar *what, const gchar *body, gssize len)
+{
+	if (!purple_debug_is_enabled()) {
+		return;
+	}
+
+	gchar *shown = discord_redact(body ? body : "(null)", body ? len : -1);
+	purple_debug(level, "discord", "%s: %s\n", what, shown);
+	g_free(shown);
+}
+
 static void
 discord_response_callback(PurpleHttpConnection *http_conn,
 							PurpleHttpResponse *response, gpointer user_data)
@@ -1778,10 +1894,10 @@ discord_response_callback(PurpleHttpConnection *http_conn,
 	} else {
 		JsonNode *root = json_parser_get_root(parser);
 
-		if (discord_url_is_sensitive(request_url)) {
+		if (discord_url_is_auth(request_url)) {
 			purple_debug_misc("discord", "Got response: ###AUTH RESPONSE REMOVED###\n");
 		} else {
-			purple_debug_misc("discord", "Got response: %s\n", body ? body : "(null)");
+			discord_debug_redacted(PURPLE_DEBUG_MISC, "Got response", body, body ? (gssize) body_len : -1);
 		}
 
 		if (conn->callback) {
@@ -1841,13 +1957,17 @@ discord_fetch_url_with_method_len(DiscordAccount *ya, const gchar *method, const
 
 	if (ya->token) {
 		purple_http_request_header_set(request, "Authorization", ya->token);
+	} else if (ya->fingerprint) {
+		/* Discord ties the login and its 2FA ticket to this fingerprint */
+		purple_http_request_header_set(request, "X-Fingerprint", ya->fingerprint);
+		purple_http_request_header_set(request, "Referer", "https://" DISCORD_API_SERVER "/login");
 	}
 
 	if (postdata) {
-		if (discord_url_is_sensitive(url)) {
+		if (discord_url_is_auth(url)) {
 			purple_debug_info("discord", "With postdata ###AUTH DATA REMOVED###\n");
 		} else {
-			purple_debug_info("discord", "With postdata %s\n", postdata);
+			discord_debug_redacted(PURPLE_DEBUG_INFO, "With postdata", postdata, -1);
 		}
 
 		if (postdata[0] == '{') {
@@ -2968,9 +3088,13 @@ discord_download_image_cb(DiscordAccount *da, JsonNode *node, gpointer user_data
 		gsize img_data_len = json_object_get_int_member(response, "len");
 		gpointer img_data = g_memdup2(img_data_s, img_data_len);
 		int img_id = purple_imgstore_add_with_id(img_data, img_data_len, NULL);
+		const gchar *alt = img_context->label ? img_context->label : img_context->url;
+		const gchar *link_text = img_context->label ? img_context->label : _("(link)");
 
 		if (img_id >= 0) {
-			attachment_show = g_strdup_printf("<img id=\"%u\" alt=\"%s\"/><br /><a href=\"%s\">(link)</a>", img_id, img_context->url, img_context->url);
+			attachment_show = g_strdup_printf("<img id=\"%u\" alt=\"%s\"/><br /><a href=\"%s\">%s</a>", img_id, alt, img_context->url, link_text);
+		} else if (img_context->label) {
+			attachment_show = g_strdup_printf("%s <a href=\"%s\">%s</a>", alt, img_context->url, _("(link)"));
 		} else {
 			attachment_show = g_strdup(img_context->url);
 		}
@@ -2978,17 +3102,46 @@ discord_download_image_cb(DiscordAccount *da, JsonNode *node, gpointer user_data
 		if (img_context->conv_id >= 0) {
 			purple_serv_got_chat_in(da->pc, img_context->conv_id, img_context->from, img_context->flags, attachment_show, img_context->timestamp);
 		} else {
-			purple_serv_got_im(da->pc, img_context->from, attachment_show, img_context->flags, img_context->timestamp);
+			if (img_context->flags & PURPLE_MESSAGE_SEND) {
+				PurpleIMConversation *imconv = purple_conversations_find_im_with_account(img_context->from, da->account);
+				if (imconv) {
+					PurpleMessage *msg = purple_message_new_outgoing(img_context->from, attachment_show, img_context->flags);
+					purple_message_set_time(msg, img_context->timestamp);
+					purple_conversation_write_message(PURPLE_CONVERSATION(imconv), msg);
+					purple_message_destroy(msg);
+				} else {
+					purple_serv_got_im(da->pc, img_context->from, attachment_show, img_context->flags, img_context->timestamp);
+				}
+			} else {
+				purple_serv_got_im(da->pc, img_context->from, attachment_show, img_context->flags, img_context->timestamp);
+			}
 		}
 		g_free(attachment_show);
 
 	} else {
 		purple_debug_error("discord", "Image response node is null!\n");
+		gchar *fallback = img_context->label ?
+			g_strdup_printf("%s <a href=\"%s\">%s</a>", img_context->label, img_context->url, _("(link)")) :
+			g_strdup(img_context->url);
+
 		if (img_context->conv_id >= 0) {
-			purple_serv_got_chat_in(da->pc, img_context->conv_id, img_context->from, img_context->flags, img_context->url, img_context->timestamp);
+			purple_serv_got_chat_in(da->pc, img_context->conv_id, img_context->from, img_context->flags, fallback, img_context->timestamp);
 		} else {
-			purple_serv_got_im(da->pc, img_context->from, img_context->url, img_context->flags, img_context->timestamp);
+			if (img_context->flags & PURPLE_MESSAGE_SEND) {
+				PurpleIMConversation *imconv = purple_conversations_find_im_with_account(img_context->from, da->account);
+				if (imconv) {
+					PurpleMessage *msg = purple_message_new_outgoing(img_context->from, fallback, img_context->flags);
+					purple_message_set_time(msg, img_context->timestamp);
+					purple_conversation_write_message(PURPLE_CONVERSATION(imconv), msg);
+					purple_message_destroy(msg);
+				} else {
+					purple_serv_got_im(da->pc, img_context->from, fallback, img_context->flags, img_context->timestamp);
+				}
+			} else {
+				purple_serv_got_im(da->pc, img_context->from, fallback, img_context->flags, img_context->timestamp);
+			}
 		}
+		g_free(fallback);
 	}
 
 	discord_free_image_context(img_context);
@@ -3038,6 +3191,162 @@ discord_treat_room_as_small(DiscordAccount *da, guint64 room_id, DiscordGuild *g
 		return TRUE;
 	}
 	return FALSE;
+}
+
+static gchar *
+discord_get_sticker_url(const gchar *sticker_id, gint64 format_type)
+{
+	if (!sticker_id)
+		return NULL;
+
+	if (format_type == 4) {
+		return g_strdup_printf("https://media.discordapp.net/stickers/%s.gif", sticker_id);
+	} else if (format_type == 3) {
+		return g_strdup_printf("https://" DISCORD_CDN_SERVER "/stickers/%s.json", sticker_id);
+	} else {
+		return g_strdup_printf("https://" DISCORD_CDN_SERVER "/stickers/%s.png", sticker_id);
+	}
+}
+
+typedef struct {
+	gint conv_id;
+	gchar *from;
+	gchar *shortcut;
+	gint64 format_type;
+} DiscordStickerData;
+
+static void
+discord_fetch_sticker_cb(DiscordAccount *da, JsonNode *node, gpointer user_data)
+{
+	DiscordStickerData *data = user_data;
+
+	if (node != NULL) {
+		JsonObject *response = json_node_get_object(node);
+		const gchar *response_str;
+		gsize response_len;
+		PurpleSmiley *smiley = NULL;
+
+		response_str = g_dataset_get_data(node, "raw_body");
+		response_len = json_object_get_int_member(response, "len");
+
+		if (response_str && response_len > 0) {
+			if (data->format_type == 3) {
+				gsize gif_len = 0;
+				gpointer gif_data = discord_lottie_render_to_gif(response_str, 160, 160, 30, &gif_len);
+				if (gif_data != NULL) {
+					smiley = purple_smiley_new_from_data(data->shortcut, (const guchar *) gif_data, gif_len);
+					g_free(gif_data);
+				}
+			} else {
+				smiley = purple_smiley_new_from_data(data->shortcut, (const guchar *) response_str, response_len);
+			}
+
+			if (smiley != NULL) {
+				PurpleConversation *conv = NULL;
+				if (data->conv_id >= 0) {
+					PurpleChatConversation *chatconv = purple_conversations_find_chat(da->pc, data->conv_id);
+					if (chatconv)
+						conv = PURPLE_CONVERSATION(chatconv);
+				} else if (data->from) {
+					PurpleIMConversation *imconv = purple_conversations_find_im_with_account(data->from, da->account);
+					if (imconv)
+						conv = PURPLE_CONVERSATION(imconv);
+				}
+
+				if (conv != NULL) {
+					purple_conversation_add_smiley(conv, smiley);
+				}
+				g_object_unref(G_OBJECT(smiley));
+			}
+		}
+	}
+
+	g_free(data->shortcut);
+	g_free(data->from);
+	g_free(data);
+}
+
+static void
+discord_process_stickers(DiscordAccount *da, JsonArray *stickers, PurpleConversation *conv,
+                         gint conv_id, const gchar *from, PurpleMessageFlags flags,
+                         time_t timestamp, DiscordGuild *guild, guint64 channel_id)
+{
+	if (stickers == NULL || from == NULL)
+		return;
+
+	guint stickers_len = json_array_get_length(stickers);
+	for (guint n = 0; n < stickers_len; n++) {
+		JsonObject *sticker = json_array_get_object_element(stickers, n);
+		if (sticker == NULL)
+			continue;
+
+		const gchar *sticker_id = json_object_get_string_member(sticker, "id");
+		gint64 format_type = json_object_get_int_member(sticker, "format_type");
+
+		if (!sticker_id)
+			continue;
+
+		gchar *url = discord_get_sticker_url(sticker_id, format_type);
+
+		if (conv == NULL) {
+			if (conv_id >= 0) {
+				PurpleChatConversation *chatconv = purple_conversations_find_chat(da->pc, conv_id);
+				if (chatconv)
+					conv = PURPLE_CONVERSATION(chatconv);
+			} else {
+				PurpleIMConversation *imconv = purple_conversations_find_im_with_account(from, da->account);
+				if (imconv == NULL)
+					imconv = purple_im_conversation_new(da->account, from);
+				conv = PURPLE_CONVERSATION(imconv);
+			}
+		}
+
+		if (conv_id >= 0) {
+			purple_serv_got_chat_in(da->pc, conv_id, from, flags | PURPLE_MESSAGE_NO_LINKIFY, url, timestamp);
+		} else {
+			if (flags & PURPLE_MESSAGE_SEND) {
+				PurpleMessage *msg = purple_message_new_outgoing(from, url, flags | PURPLE_MESSAGE_NO_LINKIFY);
+				purple_message_set_time(msg, timestamp);
+				purple_conversation_write_message(conv, msg);
+				purple_message_destroy(msg);
+			} else {
+				purple_serv_got_im(da->pc, from, url, flags | PURPLE_MESSAGE_NO_LINKIFY, timestamp);
+			}
+		}
+
+		if (conv != NULL) {
+			GList *l = conv->logs;
+			if (l != NULL) {
+				PurpleLog *log = l->data;
+				purple_log_write(log, flags | PURPLE_MESSAGE_INVISIBLE, from, timestamp, url);
+			}
+		}
+
+		gboolean is_image = (format_type == 1 || format_type == 2 || format_type == 4 ||
+		                     (format_type == 3 && discord_lottie_is_available()));
+		gboolean should_download = is_image && purple_account_get_bool(da->account, "display-stickers", purple_strequal(purple_core_get_ui(), "gtk-gaim"));
+
+		if (conv_id >= 0 && should_download) {
+			if (!discord_treat_room_as_small(da, channel_id, guild) &&
+			    !purple_account_get_bool(da->account, "display-images-large-servers", FALSE)) {
+				should_download = FALSE;
+			}
+		}
+
+		if (should_download) {
+			if (conv == NULL || !purple_conversation_get_smiley(conv, url)) {
+				DiscordStickerData *sticker_data = g_new0(DiscordStickerData, 1);
+				sticker_data->conv_id = conv_id;
+				sticker_data->from = g_strdup(from);
+				sticker_data->shortcut = g_strdup(url);
+				sticker_data->format_type = format_type;
+
+				discord_fetch_url(da, url, NULL, discord_fetch_sticker_cb, sticker_data);
+			}
+		}
+
+		g_free(url);
+	}
 }
 
 static void discord_thread_parent_cb(DiscordAccount *da, JsonNode *node, gpointer user_data);
@@ -4419,6 +4728,9 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 	JsonArray *attachments = json_object_get_array_member(data, "attachments");
 	JsonArray *embeds = json_object_get_array_member(data, "embeds");
 	JsonArray *stickers = json_object_get_array_member(data, "sticker_items");
+	if (stickers == NULL) {
+		stickers = json_object_get_array_member(data, "stickers");
+	}
 	JsonArray *reactions = json_object_get_array_member(data, "reactions");
 	JsonArray *mentions = json_object_get_array_member(data, "mentions");
 	JsonArray *mention_roles = json_object_get_array_member(data, "mention_roles");
@@ -4604,19 +4916,6 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 		embeds = NULL;
 	}
 
-	if (stickers != NULL) {
-		guint stickers_len = json_array_get_length(stickers);
-
-		for (guint n = 0; n < stickers_len; n++) {
-			JsonObject *sticker = json_array_get_object_element(stickers, n);
-			const gchar *sticker_id = json_object_get_string_member(sticker, "id");
-			const gchar *sticker_format = json_object_get_int_member(sticker, "format_type") == 3 ? "json" : "png";
-
-			tmp = g_strdup_printf("%s\nhttps://" DISCORD_CDN_SERVER "/stickers/%s.%s", escaped_content, sticker_id, sticker_format);
-			g_free(escaped_content);
-			escaped_content = tmp;
-		}
-	}
 
 	if (embeds != NULL) {
 		GString *embed_str = g_string_new(NULL);
@@ -4895,6 +5194,10 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 						}
 					}
 				}
+
+				if (stickers) {
+					discord_process_stickers(da, stickers, conv, -1, username, flags, timestamp, guild, channel_id);
+				}
 			}
 		} else {
 			DiscordUser *author = discord_upsert_user(da->new_users, author_obj);
@@ -4979,6 +5282,10 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 					}
 
 				}
+			}
+
+			if (stickers) {
+				discord_process_stickers(da, stickers, conv, -1, merged_username, flags, timestamp, guild, channel_id);
 			}
 
 			g_free(merged_username);
@@ -5252,6 +5559,10 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 					purple_serv_got_chat_in(da->pc, discord_chat_hash(channel_id), name, flags, url_log, timestamp);
 				}
 			}
+		}
+
+		if (stickers) {
+			discord_process_stickers(da, stickers, conv, discord_chat_hash(channel_id), name, flags, timestamp, guild, channel_id);
 		}
 
 		if (native) {
@@ -5569,6 +5880,47 @@ discord_get_chat_display_name(DiscordAccount *da, guint64 channel_id)
 	return NULL;
 }
 
+static void
+discord_rename_blist_chat(PurpleChat *chat, const gchar *old_name, const gchar *new_name)
+{
+#if !PURPLE_VERSION_CHECK(3, 0, 0)
+	/* An alias that just mirrors the old name follows the rename */
+	if (old_name != NULL && *old_name != '\0' && purple_strequal(chat->alias, old_name)) {
+		purple_blist_alias_chat(chat, new_name);
+	}
+#endif
+
+	/* May free old_name if it came from the components */
+	g_hash_table_replace(purple_chat_get_components(chat), g_strdup("name"), g_strdup(new_name));
+}
+
+static void
+discord_set_channel_name(DiscordAccount *da, DiscordChannel *channel, const gchar *new_name)
+{
+	if (new_name == NULL || *new_name == '\0' || purple_strequal(channel->name, new_name)) {
+		return;
+	}
+
+	gchar *channel_id_str = from_int(channel->id);
+	PurpleChat *chat = discord_find_chat(da->account, channel_id_str);
+	g_free(channel_id_str);
+
+	if (chat != NULL) {
+		discord_rename_blist_chat(chat, channel->name, new_name);
+	}
+
+	g_free(channel->name);
+	channel->name = g_strdup(new_name);
+
+	PurpleChatConversation *chatconv = purple_conversations_find_chat(da->pc, discord_chat_hash(channel->id));
+	if (chatconv != NULL) {
+		const gchar *display_name = discord_get_chat_display_name(da, channel->id);
+		if (display_name != NULL) {
+			purple_conversation_set_title(PURPLE_CONVERSATION(chatconv), display_name);
+		}
+	}
+}
+
 
 static void
 discord_add_channel_to_blist(DiscordAccount *da, DiscordChannel *channel, PurpleGroup *group)
@@ -5635,6 +5987,7 @@ discord_got_group_dm(DiscordAccount *da, JsonObject *data)
 {
 	DiscordChannel *channel = discord_new_channel(data);
 	JsonArray *recipients = json_object_get_array_member(data, "recipients");
+	JsonArray *recipient_ids = json_object_get_array_member(data, "recipient_ids");
 
 	/* In order to efficiently strip discriminators, we need to maintain a
 	 * set of names, so we can check in constant-time whether there would
@@ -5654,15 +6007,39 @@ discord_got_group_dm(DiscordAccount *da, JsonObject *data)
 		discord_got_group_dm_name(channel, recipient, TRUE);
 	}
 
+	/* New API: READY only sends the ids, the users were already loaded */
+	for (int i = json_array_get_length(recipient_ids) - 1; i >= 0; i--) {
+		DiscordUser *recipient = discord_get_user(da, to_int(json_array_get_string_element(recipient_ids, i)));
+
+		if (recipient == NULL) {
+			continue;
+		}
+
+		channel->recipients = g_list_prepend(channel->recipients, g_memdup2(&(recipient->id), sizeof(guint64)));
+
+		discord_got_group_dm_name(channel, recipient, TRUE);
+	}
+
 	g_hash_table_replace_int64(da->group_dms, channel->id, channel);
 
-	channel->name = discord_name_group_dm(da, channel);
+	/* Keep the custom name if the group DM has one, otherwise name it after the recipients */
+	if (channel->name == NULL || *channel->name == '\0') {
+		g_free(channel->name);
+		channel->name = discord_name_group_dm(da, channel);
+	}
 
 	gchar *id = from_int(channel->id);
+	PurpleChat *chat = discord_find_chat(da->account, id);
 
-	if (purple_account_is_connected(da->account)
-		&& purple_account_get_bool(da->account, "populate-blist", TRUE)
-		&& purple_blist_find_chat(da->account, id) == NULL) {
+	if (chat != NULL) {
+		/* channel is new, so the previous name is the one stored in the blist */
+		const gchar *old_name = g_hash_table_lookup(purple_chat_get_components(chat), "name");
+
+		if (channel->name != NULL && *channel->name != '\0' && !purple_strequal(old_name, channel->name)) {
+			discord_rename_blist_chat(chat, old_name, channel->name);
+		}
+	} else if (purple_account_is_connected(da->account)
+		&& purple_account_get_bool(da->account, "populate-blist", TRUE)) {
 
 		discord_add_channel_to_blist(da, channel, NULL);
 	}
@@ -5814,6 +6191,12 @@ discord_got_user_status(DiscordAccount *da, const gchar *username, const gchar *
 static void
 discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data)
 {
+	/* Every branch below reads from data; a dispatch frame without an object "d" has none. */
+	if (data == NULL) {
+		purple_debug_info("discord", "discord_process_dispatch: no/malformed data for %s, skipping\n", type ? type : "(null)");
+		return;
+	}
+
 	if (purple_strequal(type, "PRESENCE_UPDATE")) {
 		JsonObject *userdata = json_object_get_object_member(data, "user");
 		DiscordUser *user = discord_upsert_user(da->new_users, userdata);
@@ -6225,39 +6608,18 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 		guint64 channel_id = to_int(json_object_get_string_member(data, "id"));
 		gint64 channel_type = json_object_get_int_member(data, "type");
 
-		if (channel_type != CHANNEL_GROUP_DM && json_object_has_member(data, "name")) {
-			DiscordChannel *channel = discord_get_channel_global_int(da, channel_id);
-			const gchar *new_name = json_object_get_string_member(data, "name");
+		DiscordChannel *channel = discord_get_channel_global_int(da, channel_id);
 
-			if (channel != NULL && new_name != NULL && *new_name != '\0' &&
-			    !purple_strequal(channel->name, new_name)) {
-				const gchar *old_name = channel->name;
-				gchar *channel_id_str = from_int(channel_id);
-				PurpleChat *chat = discord_find_chat(da->account, channel_id_str);
-				g_free(channel_id_str);
+		if (channel != NULL && channel_type == CHANNEL_GROUP_DM) {
+			/* An unnamed group DM is named after its recipients */
+			const gchar *custom_name = json_object_get_string_member(data, "name");
+			gchar *new_name = (custom_name != NULL && *custom_name != '\0') ?
+				g_strdup(custom_name) : discord_name_group_dm(da, channel);
 
-				if (chat != NULL) {
-					GHashTable *components = purple_chat_get_components(chat);
-					g_hash_table_replace(components, g_strdup("name"), g_strdup(new_name));
-
-#if !PURPLE_VERSION_CHECK(3, 0, 0)
-					if (purple_strequal(chat->alias, old_name)) {
-						purple_blist_alias_chat(chat, new_name);
-					}
-#endif
-				}
-
-				g_free(channel->name);
-				channel->name = g_strdup(new_name);
-
-				PurpleChatConversation *chatconv = purple_conversations_find_chat(da->pc, discord_chat_hash(channel_id));
-				if (chatconv != NULL) {
-					const gchar *display_name = discord_get_chat_display_name(da, channel_id);
-					if (display_name != NULL) {
-						purple_conversation_set_title(PURPLE_CONVERSATION(chatconv), display_name);
-					}
-				}
-			}
+			discord_set_channel_name(da, channel, new_name);
+			g_free(new_name);
+		} else if (channel != NULL && json_object_has_member(data, "name")) {
+			discord_set_channel_name(da, channel, json_object_get_string_member(data, "name"));
 		}
 
 		if ((channel_type == CHANNEL_GUILD_TEXT && json_object_has_member(data, "topic")) || channel_type == CHANNEL_GROUP_DM) {
@@ -6279,8 +6641,13 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 			guint64 parent_id = to_int(json_object_get_string_member(thread, "parent_id"));
 			DiscordChannel *parent = discord_get_channel_global_int(da, parent_id);
 
-			if (parent && !g_hash_table_contains_int64(parent->threads, thread_id)) {
-				discord_add_thread(da, guild, parent, thread, guild_id);
+			if (parent) {
+				if (parent->threads == NULL) {
+					parent->threads = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, NULL);
+				}
+				if (!g_hash_table_contains_int64(parent->threads, thread_id)) {
+					discord_add_thread(da, guild, parent, thread, guild_id);
+				}
 			}
 		}
 
@@ -7681,6 +8048,47 @@ discord_send_lazy_guild_request(DiscordAccount *da, DiscordGuild *guild)
 	g_free(guild_id);
 }
 
+/* On user accounts Discord pushes MESSAGE_CREATE only for channels the client views.
+ * discord_send_lazy_guild_request subscribes one member-list channel per guild; this op 14 request
+ * puts the given channel in "channels", which marks it as viewed. */
+static void
+discord_subscribe_channel(DiscordAccount *da, DiscordGuild *guild, guint64 channel_id)
+{
+	if (guild == NULL || channel_id == 0) {
+		return;
+	}
+
+	JsonObject *d = json_object_new();
+	gchar *guild_id_s = from_int(guild->id);
+	gchar *channel_id_s = from_int(channel_id);
+
+	json_object_set_string_member(d, "guild_id", guild_id_s);
+	json_object_set_boolean_member(d, "typing", TRUE);
+	json_object_set_boolean_member(d, "threads", TRUE);
+	json_object_set_boolean_member(d, "activities", TRUE);
+	json_object_set_array_member(d, "members", json_array_new());
+
+	/* one member range (0-99) is enough to register the channel as "viewed" */
+	JsonObject *channels = json_object_new();
+	JsonArray *ranges = json_array_new();
+	JsonArray *range = json_array_new();
+	json_array_add_int_element(range, 0);
+	json_array_add_int_element(range, 99);
+	json_array_add_array_element(ranges, range);
+	json_object_set_array_member(channels, channel_id_s, ranges);
+	json_object_set_object_member(d, "channels", channels);
+
+	JsonObject *obj = json_object_new();
+	json_object_set_int_member(obj, "op", OP_LAZY_GUILD_REQUEST);
+	json_object_set_object_member(obj, "d", d);
+
+	discord_socket_write_json(da, obj);
+
+	json_object_unref(obj);
+	g_free(guild_id_s);
+	g_free(channel_id_s);
+}
+
 static void
 discord_guild_get_offline_users(DiscordAccount *da, const gchar *guild_id)
 {
@@ -7907,15 +8315,35 @@ discord_mfa_text_entry(gpointer user_data, const gchar *code)
 {
 	DiscordAccount *da = user_data;
 	JsonObject *data = json_object_new();
-	gchar *str;
+	GString *clean_code = g_string_new(NULL);
+	const gchar *method;
+	gchar *str, *url;
 
-	json_object_set_string_member(data, "code", code);
+	/* Backup codes are shown as "xxxx-xxxx"; send just the characters */
+	for (; code && *code; code++) {
+		if (*code != '-' && !g_ascii_isspace(*code)) {
+			g_string_append_c(clean_code, *code);
+		}
+	}
+
+	/* 6-digit authenticator codes go to /totp, 8-character backup codes to /backup */
+	method = clean_code->len == 8 ? "backup" : "totp";
+
+	json_object_set_string_member(data, "code", clean_code->str);
 	json_object_set_string_member(data, "ticket", da->mfa_ticket);
+	if (da->login_instance_id) {
+		json_object_set_string_member(data, "login_instance_id", da->login_instance_id);
+	}
+	json_object_set_null_member(data, "login_source");
+	json_object_set_null_member(data, "gift_code_sku_id");
 
 	str = json_object_to_string(data);
-	discord_fetch_url(da, "https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/auth/mfa/totp", str, discord_login_response, NULL);
+	url = g_strdup_printf("https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/auth/mfa/%s", method);
+	discord_fetch_url(da, url, str, discord_login_response, NULL);
 
+	g_free(url);
 	g_free(str);
+	g_string_free(clean_code, TRUE);
 	json_object_unref(data);
 
 	g_free(da->mfa_ticket);
@@ -7947,14 +8375,31 @@ discord_login_response(DiscordAccount *da, JsonNode *node, gpointer user_data)
 		}
 
 		if (json_object_get_boolean_member(response, "mfa")) {
+			gboolean has_totp = json_object_get_boolean_member(response, "totp");
+			gboolean has_backup = json_object_get_boolean_member(response, "backup");
+			const gchar *hint;
+
+			/* Tell the user which codes this account can actually use */
+			if (has_totp && has_backup) {
+				hint = _("Enter the 6-digit code from your authenticator app, or one of your 8-character backup codes.");
+			} else if (has_totp) {
+				hint = _("Enter the 6-digit code from your authenticator app.");
+			} else if (has_backup) {
+				hint = _("This Discord account has no authenticator app set up, so authenticator codes will not work. Enter one of your 8-character backup codes.");
+			} else {
+				hint = _("This Discord account only has two-factor methods this client cannot use (SMS or a security key). Log in with a token instead.");
+			}
+
 			g_free(da->mfa_ticket);
 			da->mfa_ticket = g_strdup(json_object_get_string_member(response, "ticket"));
+			g_free(da->login_instance_id);
+			da->login_instance_id = g_strdup(json_object_get_string_member(response, "login_instance_id"));
 
 			purple_request_input(
 				da->pc,
 				_("Two-factor authentication"),
 				_("Enter Discord auth code"),
-				_("You can get this token from your two-factor authentication mobile app."),
+				hint,
 				NULL, FALSE, FALSE, "",
 				_("_Login"), G_CALLBACK(discord_mfa_text_entry),
 				_("_Cancel"), G_CALLBACK(discord_mfa_cancel),
@@ -7998,9 +8443,80 @@ discord_login_response(DiscordAccount *da, JsonNode *node, gpointer user_data)
 				}
 			}
 		}
+
+		/* eg. {"message": "Invalid two-factor code", "code": 60008} */
+		if (json_object_has_member(response, "message")) {
+			purple_connection_error(da->pc, PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED, json_object_get_string_member(response, "message"));
+			return;
+		}
 	}
 
 	purple_connection_error(da->pc, PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED, _("Bad username/password"));
+}
+
+static void
+discord_send_login(DiscordAccount *da)
+{
+	JsonObject *data = json_object_new();
+	gchar *str;
+
+	json_object_set_string_member(data, "login", purple_account_get_username(da->account));
+	json_object_set_string_member(data, "password", purple_connection_get_password(da->pc));
+	json_object_set_boolean_member(data, "undelete", FALSE);
+	json_object_set_null_member(data, "login_source");
+	json_object_set_null_member(data, "gift_code_sku_id");
+
+	str = json_object_to_string(data);
+	discord_fetch_url(da, "https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/auth/login", str, discord_login_response, NULL);
+
+	g_free(str);
+	json_object_unref(data);
+}
+
+/* Discord issues only 3 valid fingerprints per IP every 2 minutes; past that it still hands
+ * out fingerprints, but invalid ones. Reconnects within that window (or other accounts, since
+ * the limit is per IP) reuse the last one instead of asking again. */
+#define DISCORD_FINGERPRINT_REUSE_SECONDS 120
+static gchar *discord_last_fingerprint = NULL;
+static time_t discord_last_fingerprint_time = 0;
+
+static void
+discord_got_login_fingerprint(DiscordAccount *da, JsonNode *node, gpointer user_data)
+{
+	gboolean from_experiments = GPOINTER_TO_INT(user_data);
+
+	if (node == NULL) {
+		/* The connection already failed or went away */
+		return;
+	}
+
+	if (JSON_NODE_HOLDS_OBJECT(node)) {
+		const gchar *fingerprint = json_object_get_string_member(json_node_get_object(node), "fingerprint");
+
+		if (fingerprint != NULL) {
+			g_free(da->fingerprint);
+			da->fingerprint = g_strdup(fingerprint);
+
+			g_free(discord_last_fingerprint);
+			discord_last_fingerprint = g_strdup(fingerprint);
+			discord_last_fingerprint_time = time(NULL);
+		}
+	}
+
+	if (da->fingerprint == NULL && from_experiments) {
+		/* Older way of getting one */
+		purple_debug_warning("discord", "No fingerprint from /experiments, trying /auth/fingerprint\n");
+		discord_fetch_url(da, "https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/auth/fingerprint", "{}", discord_got_login_fingerprint, GINT_TO_POINTER(FALSE));
+		return;
+	}
+
+	if (da->fingerprint == NULL) {
+		purple_debug_warning("discord", "No login fingerprint; two-factor authentication may fail\n");
+	} else {
+		purple_debug_info("discord", "Got login fingerprint\n");
+	}
+
+	discord_send_login(da);
 }
 
 void
@@ -8010,10 +8526,6 @@ discord_login(PurpleAccount *account)
 	PurpleConnection *pc = purple_account_get_connection(account);
 	PurpleConnectionFlags pc_flags;
 
-	if (!strchr(purple_account_get_username(account), '@')) {
-		purple_connection_error(pc, PURPLE_CONNECTION_ERROR_INVALID_USERNAME, _("Username needs to be an email address"));
-		return;
-	}
 
 	pc_flags = purple_connection_get_flags(pc);
 	pc_flags |= PURPLE_CONNECTION_FLAG_HTML;
@@ -8028,6 +8540,8 @@ discord_login(PurpleAccount *account)
 	da->pc = pc;
 	da->cookie_table = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 	da->http_keepalive_pool = purple_http_keepalive_pool_new();
+	/* Bound the REST connections per host; excess requests queue in order */
+	purple_http_keepalive_pool_set_limit_per_host(da->http_keepalive_pool, 6);
 	discord_native_init(da);
 
 	da->last_load_last_message_id = (guint64) purple_account_get_int(account, "last_message_id_high", 0);
@@ -8069,17 +8583,23 @@ discord_login(PurpleAccount *account)
 		discord_start_socket(da);
 
 	} else if (account_password && *account_password) {
-		JsonObject *data = json_object_new();
-		gchar *str;
+		/* The email+password path, and the only one that needs an address. */
+		if (!strchr(purple_account_get_username(account), '@')) {
+			purple_connection_error(pc, PURPLE_CONNECTION_ERROR_INVALID_USERNAME, _("Username needs to be an email address"));
+			return;
+		}
 
-		json_object_set_string_member(data, "login", purple_account_get_username(account));
-		json_object_set_string_member(data, "password", account_password);
+		time_t fingerprint_age = time(NULL) - discord_last_fingerprint_time;
 
-		str = json_object_to_string(data);
-		discord_fetch_url(da, "https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/auth/login", str, discord_login_response, NULL);
-
-		g_free(str);
-		json_object_unref(data);
+		if (discord_last_fingerprint != NULL && fingerprint_age >= 0 && fingerprint_age < DISCORD_FINGERPRINT_REUSE_SECONDS) {
+			purple_debug_info("discord", "Reusing the login fingerprint from %d seconds ago\n", (int) fingerprint_age);
+			da->fingerprint = g_strdup(discord_last_fingerprint);
+			discord_send_login(da);
+		} else {
+			/* Without a fingerprint Discord rejects every 2FA code (and may sign the account out everywhere).
+			 * Unauthenticated requests to /experiments hand one out. */
+			discord_fetch_url(da, "https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/experiments", NULL, discord_got_login_fingerprint, GINT_TO_POINTER(TRUE));
+		}
 
 	} else {
 #ifdef	USE_QRCODE_AUTH
@@ -8201,8 +8721,18 @@ discord_close(PurpleConnection *pc)
 	da->cookie_table = NULL;
 	g_free(da->frame);
 	da->frame = NULL;
+	if (da->frame_fragments != NULL) {
+		g_byte_array_free(da->frame_fragments, TRUE);
+		da->frame_fragments = NULL;
+	}
 	g_free(da->token);
 	da->token = NULL;
+	g_free(da->fingerprint);
+	da->fingerprint = NULL;
+	g_free(da->mfa_ticket);
+	da->mfa_ticket = NULL;
+	g_free(da->login_instance_id);
+	da->login_instance_id = NULL;
 	g_free(da->session_id);
 	da->session_id = NULL;
 	g_free(da->self_username);
@@ -8219,10 +8749,20 @@ discord_fetch_token_and_start_socket(DiscordAccount *da, JsonNode *node,
 {
 	if (node == NULL) {
 		purple_debug_error("discord", "no json node\n");
+		purple_connection_error(da->pc, PURPLE_CONNECTION_ERROR_NETWORK_ERROR,
+		                        _("Discord login failed (no response)"));
 		return;
 	}
 
 	JsonObject *response = json_node_get_object(node);
+	if (!json_object_has_member(response, "encrypted_token")) {
+		purple_debug_error("discord", "remote-auth login: no encrypted_token in response\n");
+		purple_connection_error(da->pc, PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED,
+		                        _("Discord login failed"));
+		discord_qrauth_free_keys(da);
+		return;
+	}
+
 	const gchar *encrypted_token = json_object_get_string_member(response,
 	                                                             "encrypted_token");
 	if (encrypted_token == NULL || *encrypted_token == '\0') {
@@ -8255,10 +8795,10 @@ discord_process_qrcode_auth_frame(DiscordAccount *da, const gchar *frame)
 	JsonParser *parser = json_parser_new();
 	JsonNode *root;
 
-	purple_debug_info("discord", "got auth frame data: %s\n", frame);
+	discord_debug_redacted(PURPLE_DEBUG_INFO, "got auth frame data", frame, -1);
 
 	if (!json_parser_load_from_data(parser, frame, -1, NULL)) {
-		purple_debug_error("discord", "Error parsing response: %s\n", frame);
+		discord_debug_redacted(PURPLE_DEBUG_ERROR, "Error parsing response", frame, -1);
 		g_object_unref(parser);
 		return FALSE;
 	}
@@ -8336,6 +8876,8 @@ discord_process_qrcode_auth_frame(DiscordAccount *da, const gchar *frame)
 
 			discord_display_qrcode(da->pc, qrcode_url, qrcode_utf8, qrcode_image, qrcode_image_len);
 
+			QRcode_free(qrcode);
+
 			g_free(qrcode_url);
 			g_free(qrcode_image);
 			g_free(qrcode_utf8);
@@ -8397,10 +8939,10 @@ discord_process_frame(DiscordAccount *da, const gchar *frame)
 	JsonNode *root;
 	gint64 opcode;
 
-	purple_debug_info("discord", "got frame data: %s\n", frame);
+	discord_debug_redacted(PURPLE_DEBUG_INFO, "got frame data", frame, -1);
 
 	if (!json_parser_load_from_data(parser, frame, -1, NULL)) {
-		purple_debug_error("discord", "Error parsing response: %s\n", frame);
+		discord_debug_redacted(PURPLE_DEBUG_ERROR, "Error parsing response", frame, -1);
 		g_object_unref(parser);
 		return TRUE;
 	}
@@ -8418,7 +8960,19 @@ discord_process_frame(DiscordAccount *da, const gchar *frame)
 			gint64 seq = json_object_get_int_member(obj, "s");
 
 			da->seq = seq;
-			discord_process_dispatch(da, type, json_object_get_object_member(obj, "d"));
+
+			/* "d" has been seen as an array during the presence burst after login. Check its
+			 * type first: json_object_get_object_member asserts on anything but an object or
+			 * null, and with checks disabled it hands back a bogus object. */
+			JsonNode *d_node = json_object_get_member(obj, "d");
+			JsonObject *d_obj = (d_node != NULL && (JSON_NODE_HOLDS_OBJECT(d_node) || JSON_NODE_HOLDS_NULL(d_node)))
+			                    ? json_object_get_object_member(obj, "d") : NULL;
+			if (d_node != NULL && d_obj == NULL && !JSON_NODE_HOLDS_NULL(d_node)) {
+				purple_debug_info("discord", "discord_process_frame: \"d\" is not an object (type %d) for event %s, skipping\n",
+				                   (int) json_node_get_node_type(d_node), type ? type : "(null)");
+				break;
+			}
+			discord_process_dispatch(da, type, d_obj);
 
 			break;
 		}
@@ -8585,6 +9139,10 @@ discord_socket_write_data_now(DiscordAccount *ya, const guchar *data_in, gsize d
 	guchar mkey[4] = { 0x12, 0x34, 0x56, 0x78 };
 	int ret;
 
+	if (data_len) {
+		discord_debug_redacted(PURPLE_DEBUG_INFO, "sending frame", (const gchar *) data_in, (gssize) data_len);
+	}
+
 	data = discord_websocket_mask(mkey, data_in, data_len);
 
 	if (data_len > 125) {
@@ -8616,7 +9174,10 @@ discord_socket_write_data_now(DiscordAccount *ya, const guchar *data_in, gsize d
 	}
 
 	memmove(full_data + (1 + len_size), &mkey, 4);
-	memmove(full_data + (1 + len_size + 4), data, data_len);
+	if (data_len) {
+		/* data is NULL for an empty frame, and memmove takes no NULL even for 0 bytes */
+		memmove(full_data + (1 + len_size + 4), data, data_len);
+	}
 
 	do {
 		ret = purple_ssl_write(ya->websocket, full_data, 1 + data_len + len_size + 4);
@@ -8732,31 +9293,259 @@ discord_inflate(DiscordAccount *da, gchar *frame, gsize frame_len)
 
 static gboolean discord_five_minute_restart(gpointer data);
 
+/* Bytes of websocket frame header (RFC 6455 5.2) needed, given the first have bytes of it */
+static guint
+discord_socket_frame_header_size(const guchar *header, guint have)
+{
+	if (have < 2) {
+		return 2;
+	}
+
+	switch (header[1] & 0x7f) {
+		case 126:
+			return 4;
+		case 127:
+			return 10;
+		default:
+			return 2;
+	}
+}
+
+static void
+discord_socket_protocol_error(DiscordAccount *ya, const gchar *what, guint opcode)
+{
+	purple_debug_error("discord", "websocket protocol error: %s (opcode %u)\n", what, opcode);
+	purple_connection_error(ya->pc, PURPLE_CONNECTION_ERROR_NETWORK_ERROR, _("Websocket protocol error"));
+}
+
+/* Checks the frame header in ya->frame_header and sets up ya->frame for its payload.
+ * FALSE when the header is a protocol error; the connection is then being dropped. */
+static gboolean
+discord_socket_start_frame(DiscordAccount *ya)
+{
+	const guchar *header = ya->frame_header;
+	guint opcode = header[0] & 0x0f;
+	guint64 len = header[1] & 0x7f;
+	guint64 total;
+	guint i;
+
+	if (header[0] & 0x70) {
+		/* no extension was negotiated, so the reserved bits must be clear */
+		discord_socket_protocol_error(ya, "reserved bits set", opcode);
+		return FALSE;
+	}
+	if (header[1] & 0x80) {
+		discord_socket_protocol_error(ya, "masked frame from the server", opcode);
+		return FALSE;
+	}
+
+	if (len == 126) {
+		len = ((guint64) header[2] << 8) | header[3];
+	} else if (len == 127) {
+		len = 0;
+		for (i = 2; i < 10; i++) {
+			len = (len << 8) | header[i];
+		}
+		if ((len & (1ULL << 63)) != 0) {
+			purple_debug_error("discord", "Frame length has MSB set, possible protocol error\n");
+			purple_connection_error(ya->pc, PURPLE_CONNECTION_ERROR_NETWORK_ERROR, _("Websocket protocol error"));
+			return FALSE;
+		}
+	}
+
+	if (opcode >= 8) {
+		if (opcode > 10) {
+			discord_socket_protocol_error(ya, "unknown control opcode", opcode);
+			return FALSE;
+		}
+		if (!(header[0] & 0x80) || (header[1] & 0x7f) > 125) {
+			/* control frames are never fragmented and use only the 7-bit length */
+			discord_socket_protocol_error(ya, "fragmented or oversized control frame", opcode);
+			return FALSE;
+		}
+	} else if (opcode > 2) {
+		discord_socket_protocol_error(ya, "unknown data opcode", opcode);
+		return FALSE;
+	} else if ((opcode == 0) != (ya->frame_fragments != NULL)) {
+		discord_socket_protocol_error(ya, opcode == 0 ? "continuation without a first fragment" : "new message inside a fragmented one", opcode);
+		return FALSE;
+	}
+
+	/* a fragmented message counts in full */
+	total = len;
+	if (opcode < 8 && ya->frame_fragments != NULL) {
+		total += ya->frame_fragments->len;
+	}
+
+	// Check for unreasonable frame_len value
+	if (total > (16 * 1024 * 1024)) { // 16MB max frame size
+		purple_debug_error("discord", "Unreasonable frame length: %" G_GUINT64_FORMAT "\n", total);
+		purple_connection_error(ya->pc, PURPLE_CONNECTION_ERROR_NETWORK_ERROR, _("Websocket protocol error: unreasonable frame length"));
+		return FALSE;
+	}
+
+	ya->packet_code = header[0];
+	ya->frame_len = len;
+	ya->frame_len_progress = 0;
+	ya->frame = g_new0(gchar, len + 1);
+
+	return TRUE;
+}
+
+/* Handles the frame whose payload is now complete in ya->frame. FALSE when reading must stop
+ * because the connection is being dropped or was replaced. */
+static gboolean
+discord_socket_got_frame(DiscordAccount *ya, PurpleSslConnection *conn)
+{
+	guint opcode = ya->packet_code & 0x0f;
+	gboolean fin = (ya->packet_code & 0x80) != 0;
+	gchar *message = ya->frame;
+	gsize message_len = ya->frame_len;
+	gboolean success;
+
+	ya->frame = NULL;
+	ya->packet_code = 0;
+	ya->frame_len = 0;
+	ya->frame_len_progress = 0;
+
+	if (opcode == 8) {
+		purple_debug_error("discord", "websocket closed\n");
+
+		if (message_len >= 2) {
+			gint error_code = ((guchar) message[0] << 8) + (guchar) message[1];
+			purple_debug_error("discord", "error code %d\n", error_code);
+
+			if (error_code == 4004) {
+				/* bad auth token, clear and reset */
+				g_free(message);
+				purple_account_set_string(ya->account, "token", NULL);
+
+				purple_connection_error(ya->pc, PURPLE_CONNECTION_ERROR_NETWORK_ERROR, _("Reauthentication required"));
+				return FALSE;
+			}
+
+			if (error_code >= 4010 && error_code <= 4014) {
+				/* Discord says these must not be reconnected */
+				gchar *msg = g_strdup_printf(_("Disconnected by server (code %d)"), error_code);
+				g_free(message);
+				purple_connection_error(ya->pc, PURPLE_CONNECTION_ERROR_OTHER_ERROR, msg);
+				g_free(msg);
+				return FALSE;
+			}
+
+			if (error_code == 4007 || error_code == 4009) {
+				/* Invalid seq / session timed out: the session can't be resumed */
+				ya->seq = 0;
+				g_free(ya->session_id);
+				ya->session_id = NULL;
+			}
+		}
+		g_free(message);
+
+		/* Try reconnect */
+		discord_schedule_reconnect(ya);
+		return FALSE;
+	}
+
+	if (opcode == 9) {
+		/* Ping: answer with a pong carrying the same payload */
+		discord_socket_write_data(ya, (guchar *) message, message_len, 138);
+		g_free(message);
+		return ya->websocket == conn;
+	}
+
+	if (opcode == 10) {
+		/* Ignore pong */
+		g_free(message);
+		return TRUE;
+	}
+
+	/* A message may come in several frames: a text or binary one without FIN, then continuation
+	 * frames, the last with FIN. Gather them; zlib-stream needs every byte in order. */
+	if (!fin || ya->frame_fragments != NULL) {
+		if (ya->frame_fragments == NULL) {
+			ya->frame_fragments = g_byte_array_new();
+		}
+		g_byte_array_append(ya->frame_fragments, (const guint8 *) message, message_len);
+		g_free(message);
+
+		if (!fin) {
+			return TRUE;
+		}
+
+		message_len = ya->frame_fragments->len;
+		g_byte_array_append(ya->frame_fragments, (const guint8 *) "", 1);
+		message = (gchar *) g_byte_array_free(ya->frame_fragments, FALSE);
+		ya->frame_fragments = NULL;
+	}
+
+	if (ya->compress) {
+		gchar *temp = discord_inflate(ya, message, message_len);
+		g_free(message);
+		message = temp;
+
+		if (temp == NULL) {
+			/* The shared zlib stream is now out of sync, so every later frame would fail too */
+			purple_debug_error("discord", "Failed to inflate gateway frame, reconnecting\n");
+			discord_schedule_reconnect(ya);
+			return FALSE;
+		}
+	}
+
+#ifdef USE_QRCODE_AUTH
+	if (ya->running_auth_qrcode) {
+		success = discord_process_qrcode_auth_frame(ya, message);
+	} else
+#endif
+	success = discord_process_frame(ya, message);
+	g_free(message);
+	ya->frames_since_reconnect++;
+
+	return ya->websocket != NULL && success != FALSE && ya->websocket == conn;
+}
+
 static void
 discord_socket_got_data(gpointer userdata, PurpleSslConnection *conn, PurpleInputCondition cond)
 {
 	DiscordAccount *ya = userdata;
-	guchar length_code;
 	int read_len = 0;
-	gboolean done_some_reads = FALSE;
 
 	g_return_if_fail(conn == ya->websocket);
 
-	if (G_UNLIKELY(!ya->websocket_header_received)) {
-		gint nlbr_count = 0;
+	/* The HTTP reply to the upgrade request, up to its blank line. It can arrive over several
+	 * callbacks, split anywhere, so what has been seen of it is kept in ya. */
+	while (!ya->websocket_header_received) {
 		gchar nextchar;
 
-		while (nlbr_count < 4 && purple_ssl_read(conn, &nextchar, 1) == 1) {
-			if (nextchar == '\r' || nextchar == '\n') {
-				nlbr_count++;
-			} else {
-				nlbr_count = 0;
-			}
+		read_len = purple_ssl_read(conn, &nextchar, 1);
+		if (read_len != 1) {
+			goto read_failed;
 		}
 
-		if (nlbr_count == 4) {
+		if (ya->websocket_status_len < sizeof(ya->websocket_status) - 1) {
+			ya->websocket_status[ya->websocket_status_len++] = nextchar;
+		}
+
+		if (nextchar == '\r' || nextchar == '\n') {
+			ya->websocket_header_nlbr++;
+		} else {
+			ya->websocket_header_nlbr = 0;
+		}
+
+		if (ya->websocket_header_nlbr == 4) {
+			ya->websocket_status[ya->websocket_status_len] = '\0';
+
+			if (ya->websocket_status_len != 12 || strncmp(ya->websocket_status, "HTTP/1.", 7) != 0 || strncmp(ya->websocket_status + 8, " 101", 4) != 0) {
+				gchar *status = g_strescape(ya->websocket_status, NULL);
+
+				/* e.g. a Cloudflare block; the body is not websocket frames */
+				purple_debug_error("discord", "websocket handshake refused: \"%s\"\n", status);
+				g_free(status);
+				purple_connection_error(ya->pc, PURPLE_CONNECTION_ERROR_NETWORK_ERROR, _("Websocket protocol error"));
+				return;
+			}
+
 			ya->websocket_header_received = TRUE;
-			done_some_reads = TRUE;
 
 			/* flush stuff that we attempted to send before the websocket was ready */
 			while (ya->pending_writes) {
@@ -8769,182 +9558,51 @@ discord_socket_got_data(gpointer userdata, PurpleSslConnection *conn, PurpleInpu
 		}
 	}
 
-	while (ya->frame || (read_len = purple_ssl_read(conn, &ya->packet_code, 1)) == 1) {
-		if (!ya->frame) {
-			if (ya->packet_code != 129 && ya->packet_code != 130) {
-				if (ya->packet_code == 136) {
-					purple_debug_error("discord", "websocket closed\n");
+	for (;;) {
+		if (ya->frame == NULL) {
+			/* The 2-10 byte frame header, which can also be split across callbacks */
+			guint header_size = discord_socket_frame_header_size(ya->frame_header, ya->frame_header_len);
 
-					length_code = 0;
-					purple_ssl_read(conn, &length_code, 1);
-
-					if (length_code > 0 && length_code <= 125) {
-						guchar error_buf[2];
-
-						if (purple_ssl_read(conn, &error_buf, 2) == 2) {
-							gint error_code = (error_buf[0] << 8) + error_buf[1];
-							purple_debug_error("discord", "error code %d\n", error_code);
-
-							if (error_code == 4004) {
-								/* bad auth token, clear and reset */
-								purple_account_set_string(ya->account, "token", NULL);
-
-								purple_connection_error(ya->pc, PURPLE_CONNECTION_ERROR_NETWORK_ERROR, _("Reauthentication required"));
-								return;
-							}
-
-							if (error_code >= 4010 && error_code <= 4014) {
-								/* Discord says these must not be reconnected */
-								gchar *msg = g_strdup_printf(_("Disconnected by server (code %d)"), error_code);
-								purple_connection_error(ya->pc, PURPLE_CONNECTION_ERROR_OTHER_ERROR, msg);
-								g_free(msg);
-								return;
-							}
-
-							if (error_code == 4007 || error_code == 4009) {
-								/* Invalid seq / session timed out: the session can't be resumed */
-								ya->seq = 0;
-								g_free(ya->session_id);
-								ya->session_id = NULL;
-							}
-						}
-					}
-
-					/* Try reconnect */
-					discord_schedule_reconnect(ya);
-
-					return;
-				} else if (ya->packet_code == 137) {
-					/* Ping */
-					gint ping_frame_len = 0;
-					length_code = 0;
-					purple_ssl_read(conn, &length_code, 1);
-					length_code = length_code & ~0x80;
-
-					if (length_code > 125) {
-						/* RFC 6455: control frames can't have extended lengths */
-						purple_debug_error("discord", "Ping frame too long, possible protocol error\n");
-						purple_connection_error(ya->pc, PURPLE_CONNECTION_ERROR_NETWORK_ERROR, _("Websocket protocol error"));
-						return;
-					}
-					ping_frame_len = length_code;
-
-					if (ping_frame_len > 0) {
-						guchar *pong_data = g_new0(guchar, ping_frame_len);
-						purple_ssl_read(conn, pong_data, ping_frame_len);
-
-						discord_socket_write_data(ya, pong_data, ping_frame_len, 138);
-						g_free(pong_data);
-					} else {
-						discord_socket_write_data(ya, (guchar *) "", 0, 138);
-					}
-
-					return;
-				} else if (ya->packet_code == 138) {
-					/* Ignore pong */
-					return;
+			while (ya->frame_header_len < header_size) {
+				read_len = purple_ssl_read(conn, ya->frame_header + ya->frame_header_len, header_size - ya->frame_header_len);
+				if (read_len <= 0) {
+					goto read_failed;
 				}
+				ya->frame_header_len += read_len;
+				header_size = discord_socket_frame_header_size(ya->frame_header, ya->frame_header_len);
+			}
+			ya->frame_header_len = 0;
 
-				purple_debug_error("discord", "unknown websocket error %d\n", ya->packet_code);
+			if (!discord_socket_start_frame(ya)) {
 				return;
 			}
-
-			length_code = 0;
-			purple_ssl_read(conn, &length_code, 1);
-			length_code = length_code & ~0x80;
-
-			if (length_code <= 125) {
-				ya->frame_len = length_code;
-			} else if (length_code == 126) {
-				purple_ssl_read(conn, &ya->frame_len, 2);
-				ya->frame_len = GUINT16_FROM_BE(ya->frame_len);
-			} else if (length_code == 127) {
-				purple_ssl_read(conn, &ya->frame_len, 8);
-				ya->frame_len = GUINT64_FROM_BE(ya->frame_len);
-				if ((ya->frame_len & (1ULL << 63)) != 0) {
-					purple_debug_error("discord", "Frame length has MSB set, possible protocol error\n");
-					purple_connection_error(ya->pc, PURPLE_CONNECTION_ERROR_NETWORK_ERROR, _("Websocket protocol error"));
-					return;
-				}
-			}
-
-			// Check for unreasonable frame_len value
-			if (ya->frame_len > (16 * 1024 * 1024)) { // 16MB max frame size
-				purple_debug_error("discord", "Unreasonable frame length: %" G_GUINT64_FORMAT "\n", ya->frame_len);
-				purple_connection_error(ya->pc, PURPLE_CONNECTION_ERROR_NETWORK_ERROR, _("Websocket protocol error: unreasonable frame length"));
-				return;
-			}
-
-			ya->frame = g_new0(gchar, ya->frame_len + 1);
-			ya->frame_len_progress = 0;
 		}
 
-		do {
+		while (ya->frame_len_progress < ya->frame_len) {
 			read_len = purple_ssl_read(conn, ya->frame + ya->frame_len_progress, ya->frame_len - ya->frame_len_progress);
-
-			if (read_len > 0) {
-				ya->frame_len_progress += read_len;
+			if (read_len <= 0) {
+				goto read_failed;
 			}
-		} while (read_len > 0 && ya->frame_len_progress < ya->frame_len);
+			ya->frame_len_progress += read_len;
+		}
 
-		done_some_reads = TRUE;
-
-		if (ya->frame_len_progress == ya->frame_len) {
-			gboolean success;
-
-			if (ya->compress) {
-				gchar *temp = discord_inflate(ya, ya->frame, ya->frame_len);
-				g_free(ya->frame);
-				ya->frame = temp;
-
-				if (temp == NULL) {
-					/* The shared zlib stream is now out of sync, so every later frame would fail too */
-					purple_debug_error("discord", "Failed to inflate gateway frame, reconnecting\n");
-					ya->packet_code = 0;
-					ya->frame_len = 0;
-					discord_schedule_reconnect(ya);
-					return;
-				}
-			}
-
-#ifdef USE_QRCODE_AUTH
-			if (ya->running_auth_qrcode) {
-				success = discord_process_qrcode_auth_frame(ya, ya->frame);
-			} else
-#endif
-			success = discord_process_frame(ya, ya->frame);
-			g_free(ya->frame);
-			ya->frame = NULL;
-			ya->packet_code = 0;
-			ya->frame_len = 0;
-			ya->frames_since_reconnect++;
-
-			if (G_UNLIKELY(ya->websocket == NULL || success == FALSE || ya->websocket != conn)) {
-				return;
-			}
-		} else if (read_len < 0 && errno == EAGAIN) {
-			/* Rest of the frame hasn't arrived yet */
+		if (!discord_socket_got_frame(ya, conn)) {
 			return;
-		} else {
-			/* Connection closed or failed part way through a frame */
-			done_some_reads = FALSE;
-			break;
 		}
 	}
 
-	if (done_some_reads == FALSE && read_len <= 0) {
-		if (read_len < 0 && errno == EAGAIN) {
-			return;
-		}
+read_failed:
+	if (read_len < 0 && errno == EAGAIN) {
+		return;
+	}
 
-		purple_debug_error("discord", "got errno %d, read_len %d from websocket thread\n", errno, read_len);
+	purple_debug_error("discord", "got errno %d, read_len %d from websocket thread\n", errno, read_len);
 
-		if (ya->frames_since_reconnect < 2) {
-			purple_connection_error(ya->pc, PURPLE_CONNECTION_ERROR_NETWORK_ERROR, _("Lost connection to server"));
-		} else {
-			/* Try reconnect */
-			discord_schedule_reconnect(ya);
-		}
+	if (ya->frames_since_reconnect < 2) {
+		purple_connection_error(ya->pc, PURPLE_CONNECTION_ERROR_NETWORK_ERROR, _("Lost connection to server"));
+	} else {
+		/* Try reconnect */
+		discord_schedule_reconnect(ya);
 	}
 }
 
@@ -9043,10 +9701,18 @@ discord_start_socket(DiscordAccount *da)
 	while (!g_queue_is_empty(da->delayed_writes)) {
 		discord_socket_info_free(g_queue_pop_head(da->delayed_writes));
 	}
+	da->websocket_header_nlbr = 0;
+	da->websocket_status_len = 0;
+	da->frame_header_len = 0;
 	g_free(da->frame);
 	da->frame = NULL;
 	da->packet_code = 0;
 	da->frame_len = 0;
+	da->frame_len_progress = 0;
+	if (da->frame_fragments != NULL) {
+		g_byte_array_free(da->frame_fragments, TRUE);
+		da->frame_fragments = NULL;
+	}
 	da->frames_since_reconnect = 0;
 
 #ifdef USE_QRCODE_AUTH
@@ -9322,6 +9988,9 @@ discord_chat_threads(PurpleConnection *pc, int id, const gchar *filter)
 	GHashTableIter thread_iter;
 	gpointer key, value;
 	/* TODO: get archived thread data */
+	if (channel->threads == NULL) {
+		channel->threads = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, NULL);
+	}
 	g_hash_table_iter_init(&thread_iter, channel->threads);
 
 	gchar *threads_list = g_strdup(_("Active Threads:\n<pre>Creation Time       | Last Message Time   | Name"));
@@ -9413,9 +10082,11 @@ discord_chat_invite(PurpleConnection *pc, int id, const char *message, const cha
 		return;
 	}
 
-	if (g_hash_table_contains_int64(da->group_dms, id)) {
+	if (g_hash_table_contains_int64(da->group_dms, room_id)) {
 		JsonObject *data = json_object_new();
-		json_object_set_string_member(data, "recipient", from_int(user->id));
+		gchar *recipient = from_int(user->id);
+		json_object_set_string_member(data, "recipient", recipient);
+		g_free(recipient);
 		gchar *postdata = json_object_to_string(data);
 
 		gchar *url = g_strdup_printf("https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/channels/%" G_GUINT64_FORMAT "/recipients/%" G_GUINT64_FORMAT, room_id, user->id);
@@ -10128,6 +10799,9 @@ discord_open_chat(DiscordAccount *da, guint64 id, gboolean present)
 		gchar *name = discord_create_nickname_from_id(da, guild, channel, da->self_user_id);
 		purple_chat_conversation_set_nick(chatconv, name);
 		g_free(name);
+
+		/* Without this, an open guild channel gets no new messages live. */
+		discord_subscribe_channel(da, guild, id);
 	}
 
 	return channel;
@@ -11627,6 +12301,9 @@ discord_add_account_options(GList *account_options)
 	option = purple_account_option_bool_new(_("Display custom emoji as inline images"), "show-custom-emojis", TRUE);
 	account_options = g_list_append(account_options, option);
 
+	option = purple_account_option_bool_new(_("Display stickers in conversations"), "display-stickers", purple_strequal(purple_core_get_ui(), "gtk-gaim"));
+	account_options = g_list_append(account_options, option);
+
 	option = purple_account_option_int_new(_("Approximate max number of users to keep track of, per server (0 disables)"), "max-guild-presences", 200);
 	account_options = g_list_append(account_options, option);
 
@@ -12061,6 +12738,9 @@ discord_get_thread_id_from_timestamp(DiscordAccount *da, PurpleConversation *con
 	GHashTableIter iter;
 	gpointer key, value;
 
+	if (channel->threads == NULL) {
+		channel->threads = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, NULL);
+	}
 	g_hash_table_iter_init(&iter, channel->threads);
 
 	while (g_hash_table_iter_next(&iter, &key, &value)) {
@@ -12500,6 +13180,40 @@ discord_cmd_roles(PurpleConversation *conv, const gchar *cmd, gchar **args, gcha
 }
 
 static PurpleCmdRet
+discord_cmd_sticker(PurpleConversation *conv, const gchar *cmd, gchar **args, gchar **error, gpointer data)
+{
+	PurpleConnection *pc = purple_conversation_get_connection(conv);
+	DiscordAccount *da = purple_connection_get_protocol_data(pc);
+	guint64 room_id = discord_get_channel_id_from_conv(da, conv);
+
+	if (pc == NULL || (int)room_id == -1 || args == NULL || args[0] == NULL) {
+		return PURPLE_CMD_RET_FAILED;
+	}
+
+	JsonObject *msg_data = json_object_new();
+	JsonArray *sticker_ids = json_array_new();
+	json_array_add_string_element(sticker_ids, args[0]);
+	json_object_set_array_member(msg_data, "sticker_ids", sticker_ids);
+	json_object_set_string_member(msg_data, "content", "");
+
+	gchar *nonce = g_strdup_printf("%" G_GUINT32_FORMAT, g_random_int());
+	json_object_set_string_member(msg_data, "nonce", nonce);
+	json_object_set_boolean_member(msg_data, "tts", FALSE);
+	g_hash_table_insert(da->sent_message_ids, nonce, nonce);
+
+	gchar *url = g_strdup_printf("https://" DISCORD_API_SERVER "/api/" DISCORD_API_VERSION "/channels/%" G_GUINT64_FORMAT "/messages", room_id);
+	gchar *postdata = json_object_to_string(msg_data);
+
+	discord_fetch_url(da, url, postdata, NULL, NULL);
+
+	g_free(postdata);
+	g_free(url);
+	json_object_unref(msg_data);
+
+	return PURPLE_CMD_RET_OK;
+}
+
+static PurpleCmdRet
 discord_cmd_nick(PurpleConversation *conv, const gchar *cmd, gchar **args, gchar **error, gpointer data)
 {
 	PurpleConnection *pc = purple_conversation_get_connection(conv);
@@ -12759,6 +13473,85 @@ purple_xfer_update_cb(DiscordAccount *da, JsonNode *node, gpointer userdata) {
 	}
 }
 
+static const gchar *
+discord_guess_mimetype(const gchar *filename, const guchar *data, gsize data_len)
+{
+	/* Magic bytes check */
+	if (data != NULL && data_len >= 4) {
+		if (data_len >= 8 && memcmp(data, "\x89PNG\r\n\x1a\n", 8) == 0)
+			return "image/png";
+		if (memcmp(data, "\xFF\xD8\xFF", 3) == 0)
+			return "image/jpeg";
+		if (data_len >= 6 && (memcmp(data, "GIF87a", 6) == 0 || memcmp(data, "GIF89a", 6) == 0))
+			return "image/gif";
+		if (data_len >= 12 && memcmp(data, "RIFF", 4) == 0 && memcmp(data + 8, "WEBP", 4) == 0)
+			return "image/webp";
+		if (data_len >= 8 && memcmp(data + 4, "ftyp", 4) == 0)
+			return "video/mp4";
+		if (memcmp(data, "%PDF", 4) == 0)
+			return "application/pdf";
+		if (memcmp(data, "PK\x03\x04", 4) == 0)
+			return "application/zip";
+		if (memcmp(data, "OggS", 4) == 0)
+			return "audio/ogg";
+	}
+
+	/* File extension lookup */
+	if (filename != NULL) {
+		const gchar *dot = strrchr(filename, '.');
+		if (dot != NULL) {
+			const gchar *ext = dot + 1;
+			static const struct {
+				const gchar *ext;
+				const gchar *mime;
+			} ext_map[] = {
+				{ "png",  "image/png" },
+				{ "jpg",  "image/jpeg" },
+				{ "jpeg", "image/jpeg" },
+				{ "gif",  "image/gif" },
+				{ "webp", "image/webp" },
+				{ "svg",  "image/svg+xml" },
+				{ "bmp",  "image/bmp" },
+				{ "ico",  "image/x-icon" },
+				{ "mp3",  "audio/mpeg" },
+				{ "ogg",  "audio/ogg" },
+				{ "wav",  "audio/wav" },
+				{ "flac", "audio/flac" },
+				{ "aac",  "audio/aac" },
+				{ "m4a",  "audio/mp4" },
+				{ "opus", "audio/opus" },
+				{ "mp4",  "video/mp4" },
+				{ "webm", "video/webm" },
+				{ "mkv",  "video/x-matroska" },
+				{ "mov",  "video/quicktime" },
+				{ "avi",  "video/x-msvideo" },
+				{ "txt",  "text/plain" },
+				{ "html", "text/html" },
+				{ "htm",  "text/html" },
+				{ "css",  "text/css" },
+				{ "js",   "application/javascript" },
+				{ "json", "application/json" },
+				{ "xml",  "application/xml" },
+				{ "csv",  "text/csv" },
+				{ "pdf",  "application/pdf" },
+				{ "zip",  "application/zip" },
+				{ "tar",  "application/x-tar" },
+				{ "gz",   "application/gzip" },
+				{ "7z",   "application/x-7z-compressed" },
+				{ NULL,   NULL }
+			};
+
+			for (gsize i = 0; ext_map[i].ext != NULL; i++) {
+				if (g_ascii_strcasecmp(ext, ext_map[i].ext) == 0) {
+					return ext_map[i].mime;
+				}
+			}
+		}
+	}
+
+	return "application/octet-stream";
+}
+
 // TODO progress, true cancel
 static void
 discord_xfer_send_init(PurpleXfer *xfer)
@@ -12766,7 +13559,7 @@ discord_xfer_send_init(PurpleXfer *xfer)
 	gchar *filename;
 	gchar *url;
 	gchar *nonce;
-	gchar *mimetype;
+	const gchar *mimetype;
 	GMappedFile *file;
 	GString *postdata;
 
@@ -12809,10 +13602,7 @@ discord_xfer_send_init(PurpleXfer *xfer)
 	// are NOT the responsibility of the caller
 	gchar *contents = g_mapped_file_get_contents(file);
 
-	gboolean guessing;
-	mimetype = g_content_type_guess(fullpath, (guchar *) contents, file_len, &guessing);
-	if (guessing)
-		purple_notify_info(da, fullpath, _("Guessing file type is:"), mimetype);
+	mimetype = discord_guess_mimetype(fullpath, (const guchar *) contents, file_len);
 
 	filename = g_path_get_basename(fullpath);
 	purple_xfer_set_filename(xfer, filename);
@@ -12845,7 +13635,6 @@ discord_xfer_send_init(PurpleXfer *xfer)
 	g_free(filename);
 	g_free(url);
 	g_free(nonce);
-	g_free(mimetype);
 	g_mapped_file_unref(file);
 	g_string_free(postdata, TRUE);
 }
@@ -13094,6 +13883,13 @@ plugin_load(PurplePlugin *plugin, GError **error)
 			PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_IM | PURPLE_CMD_FLAG_PROTOCOL_ONLY,
 						DISCORD_PLUGIN_ID, discord_cmd_join_server,
 						_("joinserver &lt;invite code/URL&gt;:   Joins a new server using the invite code or URL."), NULL
+	);
+
+	discord_cmd_register(
+		"sticker", "w", PURPLE_CMD_P_PLUGIN,
+		PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_IM | PURPLE_CMD_FLAG_PROTOCOL_ONLY,
+		DISCORD_PLUGIN_ID, discord_cmd_sticker,
+		_("sticker &lt;sticker_id&gt;:  Sends a sticker with the given sticker ID"), NULL
 	);
 
 #if 0
