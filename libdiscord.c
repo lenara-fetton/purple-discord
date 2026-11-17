@@ -13515,6 +13515,60 @@ discord_ipc_send_marker(PurpleAccount *account, const gchar *conv_name, const gc
 	return TRUE;
 }
 
+/*
+ * gboolean conversation-server(PurpleAccount *, const char *conv_name,
+ *                              char **server_id, char **server_name)
+ *
+ * The guild (server) of the chat conversation @conv_name, a channel id: its
+ * id and the name the buddy list groups it under (the "<guild_id>-abbr"
+ * account setting, else the guild's name), both newly allocated for the
+ * caller to free. A thread gives its parent channel's guild. FALSE, with the
+ * outputs untouched, for DMs, group DMs, unknown channels and anything else
+ * the account and UI gate rejects.
+ *
+ * The UI calls it from its create_conversation op, inside
+ * purple_serv_got_joined_chat() and so before discord_open_chat() has set
+ * the conversation's "id" data and title: it only reads the account's
+ * channel and guild tables, never the conversation, and has no side effects.
+ */
+static gboolean
+discord_ipc_conversation_server(PurpleAccount *account, const gchar *conv_name, gchar **server_id, gchar **server_name)
+{
+	DiscordAccount *da = discord_ipc_account(account);
+	DiscordGuild *guild = NULL;
+	const gchar *name;
+	gchar *abbr_id;
+	guint64 room_id;
+
+	if (da == NULL || server_id == NULL || server_name == NULL ||
+	    conv_name == NULL || !str_is_number(conv_name) || (room_id = to_int(conv_name)) == 0) {
+		return FALSE;
+	}
+
+	/* A group DM is found too, without a guild */
+	if (discord_get_channel_global_int_guild(da, room_id, &guild) == NULL) {
+		/* Threads live in their parent channel's guild */
+		discord_get_thread_global_int_guild(da, room_id, &guild);
+	}
+
+	if (guild == NULL) {
+		return FALSE;
+	}
+
+	/* The name discord_buddy_guild() gives the guild's buddy list groups */
+	abbr_id = g_strdup_printf("%" G_GUINT64_FORMAT "-abbr", guild->id);
+	name = purple_account_get_string(da->account, abbr_id, guild->name);
+	g_free(abbr_id);
+
+	if (name == NULL) {
+		return FALSE;
+	}
+
+	*server_id = from_int(guild->id);
+	*server_name = g_strdup(name);
+	return TRUE;
+}
+
 static void
 discord_ipc_register(PurplePlugin *plugin)
 {
@@ -13573,8 +13627,17 @@ discord_ipc_register(PurplePlugin *plugin)
 			purple_value_new(PURPLE_TYPE_STRING),
 			purple_value_new(PURPLE_TYPE_UINT));
 
+	purple_plugin_ipc_register(plugin, "conversation-server",
+			PURPLE_CALLBACK(discord_ipc_conversation_server),
+			purple_marshal_BOOLEAN__POINTER_POINTER_POINTER_POINTER,
+			purple_value_new(PURPLE_TYPE_BOOLEAN), 4,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_POINTER),
+			purple_value_new(PURPLE_TYPE_POINTER));
+
 	purple_debug_info("discord", "Registered IPC commands send-correction, send-reaction, "
-	                  "send-retraction, send-reply, send-marker and mam-fetch-older\n");
+	                  "send-retraction, send-reply, send-marker, mam-fetch-older and conversation-server\n");
 
 	/* The end of a scroll-back page; only a message-meta UI listens */
 	{
