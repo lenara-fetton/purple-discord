@@ -14311,14 +14311,32 @@ discord_ipc_send_marker(PurpleAccount *account, const gchar *conv_name, const gc
 	return TRUE;
 }
 
+/* A guild's name for the UI's server views: its non-empty "<guild_id>-abbr"
+ * account setting, else its name, else "" (never NULL). The buddy list
+ * (discord_buddy_guild()) still uses an empty abbreviation as it is. */
+static const gchar *
+discord_ipc_server_name(DiscordAccount *da, DiscordGuild *guild)
+{
+	gchar *abbr_id = g_strdup_printf("%" G_GUINT64_FORMAT "-abbr", guild->id);
+	const gchar *abbr = purple_account_get_string(da->account, abbr_id, NULL);
+
+	g_free(abbr_id);
+
+	if (abbr != NULL && *abbr != '\0') {
+		return abbr;
+	}
+
+	return guild->name != NULL ? guild->name : "";
+}
+
 /*
  * gboolean conversation-server(PurpleAccount *, const char *conv_name,
  *                              char **server_id, char **server_name)
  *
  * The guild (server) of the chat conversation @conv_name, a channel id: its
- * id and the name the buddy list groups it under (the "<guild_id>-abbr"
- * account setting, else the guild's name), both newly allocated for the
- * caller to free. A thread gives its parent channel's guild. FALSE, with the
+ * id and its name (discord_ipc_server_name(): a non-empty "<guild_id>-abbr"
+ * account setting, else the guild's name, else ""), both newly allocated for
+ * the caller to free. A thread gives its parent channel's guild. FALSE, with the
  * outputs untouched, for DMs, group DMs, unknown channels and anything else
  * the account and UI gate rejects.
  *
@@ -14332,8 +14350,6 @@ discord_ipc_conversation_server(PurpleAccount *account, const gchar *conv_name, 
 {
 	DiscordAccount *da = discord_ipc_account(account);
 	DiscordGuild *guild = NULL;
-	const gchar *name;
-	gchar *abbr_id;
 	guint64 room_id;
 
 	if (da == NULL || server_id == NULL || server_name == NULL ||
@@ -14351,17 +14367,8 @@ discord_ipc_conversation_server(PurpleAccount *account, const gchar *conv_name, 
 		return FALSE;
 	}
 
-	/* The name discord_buddy_guild() gives the guild's buddy list groups */
-	abbr_id = g_strdup_printf("%" G_GUINT64_FORMAT "-abbr", guild->id);
-	name = purple_account_get_string(da->account, abbr_id, guild->name);
-	g_free(abbr_id);
-
-	if (name == NULL) {
-		return FALSE;
-	}
-
 	*server_id = from_int(guild->id);
-	*server_name = g_strdup(name);
+	*server_name = g_strdup(discord_ipc_server_name(da, guild));
 	return TRUE;
 }
 
