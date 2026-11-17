@@ -343,6 +343,11 @@ typedef struct {
 	/* For threads */
 	gboolean archived;
 	gboolean locked;
+
+	/* Server tree (native_meta) */
+	gboolean nsfw;
+	guint64 login_last_message_id;  /* last_message_id when the channel became known */
+	gint64 mute_end;                /* mute_config end_time, 0: none (with muted) */
 } DiscordChannel;
 
 typedef struct {
@@ -364,6 +369,9 @@ typedef struct {
 
 	GHashTable *emojis;
 	guint64 system_channel_id; // the primary/general channel
+
+	gboolean muted;                 /* user_guild_settings (native_meta) */
+	gint64 mute_end;                /* its mute_config end_time, 0: none */
 } DiscordGuild;
 
 typedef struct {
@@ -475,7 +483,28 @@ typedef struct {
 	gint reaction_rl_remaining;     /* X-RateLimit-Remaining of the last reactors request, -1: unknown */
 	gdouble reaction_rl_reset_after;        /* X-RateLimit-Reset-After of it, seconds */
 
+	/* Server tree: see "Server tree" near the IPC commands */
+	GHashTable *chan_state;         /* channel or thread id -> DiscordChanState */
+	GHashTable *tree_pending;       /* guild ids (0: the server list) due a server-tree-changed */
+	GHashTable *state_pending;      /* channel ids due a channel-state-changed -> their guild id */
+	guint tree_idle;                /* emits both */
+	GArray *guild_order;            /* guild ids in the client's sidebar order (READY user_settings) */
+
 } DiscordAccount;
+
+/* Server tree (native_meta only) */
+static void discord_tree_changed(DiscordAccount *da, guint64 guild_id);
+static void discord_tree_state_changed(DiscordAccount *da, guint64 guild_id, guint64 channel_id);
+static void discord_tree_count_message(DiscordAccount *da, JsonObject *data);
+static void discord_tree_read(DiscordAccount *da, guint64 channel_id, guint64 msg_id);
+static void discord_tree_got_read_state(DiscordAccount *da, JsonObject *state);
+static void discord_tree_got_user_settings(DiscordAccount *da, JsonObject *settings);
+static void discord_tree_unread_update(DiscordAccount *da, JsonObject *data);
+static void discord_tree_channel_update(DiscordAccount *da, JsonObject *data);
+static void discord_tree_channel_delete(DiscordAccount *da, JsonObject *data);
+static void discord_tree_guild_update(DiscordAccount *da, JsonObject *data);
+static void discord_tree_init(DiscordAccount *da);
+static void discord_tree_free(DiscordAccount *da);
 
 /* What the plugin remembers about a message it showed (native_meta only) */
 typedef struct {
@@ -661,6 +690,8 @@ discord_new_channel(JsonObject *json)
 	channel->last_message_id = to_int(json_object_get_string_member(json, "last_message_id"));
 	channel->parent_id = to_int(json_object_get_string_member(json, "parent_id"));
 	channel->name = g_strdup(json_object_get_string_member(json, "name"));
+	channel->nsfw = json_object_get_boolean_member(json, "nsfw");
+	channel->login_last_message_id = channel->last_message_id;
 	if (!DISCORD_CHANNEL_IS_THREAD(channel->type)) {
 		channel->topic = g_strdup(json_object_get_string_member(json, "topic"));
 		channel->position = json_object_get_int_member(json, "position");
@@ -3453,6 +3484,7 @@ discord_native_init(DiscordAccount *da)
 	da->read_acked = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
 	da->reaction_msgs = g_queue_new();
 	da->reaction_rl_remaining = -1;
+	discord_tree_init(da);
 
 	purple_debug_info("discord", "UI supports message-meta: native replies, edits, reactions and deletes\n");
 }
@@ -3472,6 +3504,7 @@ discord_native_free(DiscordAccount *da)
 	g_hash_table_destroy(da->custom_emoji);
 	g_hash_table_destroy(da->read_acked);
 	da->read_acked = NULL;
+	discord_tree_free(da);
 
 	if (da->reaction_timer) {
 		purple_timeout_remove(da->reaction_timer);
@@ -4237,14 +4270,7 @@ discord_native_conv_name(DiscordAccount *da, guint64 channel_id, gboolean *is_ch
 		*is_chat = FALSE;
 		ret = g_strdup(username);
 	} else {
-		if (discord_get_channel_global_int(da, channel_id) == NULL) {
-			DiscordChannel *thread = discord_get_thread_global_int_guild(da, channel_id, NULL);
-
-			if (thread != NULL) {
-				channel_id = thread->parent_id;
-			}
-		}
-
+		/* A thread has its own conversation, named by its id */
 		*is_chat = TRUE;
 		ret = from_int(channel_id);
 	}
@@ -4375,38 +4401,28 @@ discord_native_read_set(DiscordAccount *da, guint64 channel_id, guint64 msg_id)
 
 	g_hash_table_replace(da->read_acked, g_memdup2(&channel_id, sizeof(guint64)),
 	                     g_memdup2(&msg_id, sizeof(guint64)));
+	discord_tree_read(da, channel_id, msg_id);
 	return TRUE;
 }
 
 /*
- * MESSAGE_ACK: we read a channel up to a message on another client (or
- * this one). Emits message-receipt(account, conv, message id, "displayed",
- * our account name), which a message-meta UI takes as "read elsewhere" and
- * clears the conversation's unread state. Thread acks are skipped: the UI
- * shows threads inside their parent channel's conversation.
+ * MESSAGE_ACK: we read a channel or thread up to a message on another client
+ * (or this one). Emits message-receipt(account, conv, message id,
+ * "displayed", our account name), which a message-meta UI takes as "read
+ * elsewhere" and clears the conversation's unread state, and resets the
+ * server tree's counts. A thread has its own conversation.
  */
 static void
 discord_native_message_ack(DiscordAccount *da, JsonObject *data)
 {
 	guint64 channel_id = to_int(json_object_get_string_member(data, "channel_id"));
 	const gchar *msg_id = json_object_get_string_member(data, "message_id");
-	gchar *channel_id_s, *conv_name;
+	gchar *conv_name;
 	gboolean is_chat;
 
 	if (channel_id == 0 || msg_id == NULL || to_int(msg_id) == 0) {
 		return;
 	}
-
-	channel_id_s = from_int(channel_id);
-
-	if (!g_hash_table_contains(da->one_to_ones, channel_id_s) &&
-	    discord_get_channel_global_int(da, channel_id) == NULL &&
-	    discord_get_thread_global_int_guild(da, channel_id, NULL) != NULL) {
-		g_free(channel_id_s);
-		return;
-	}
-
-	g_free(channel_id_s);
 
 	if (!discord_native_read_set(da, channel_id, to_int(msg_id))) {
 		/* Known already: the echo of our own ack, or an older one */
@@ -4752,7 +4768,11 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 		channel = discord_get_channel_global_int(da, thread->parent_id);
 	}
 
-	if (channel) {
+	if (thread && da->native_meta) {
+		/* Its own conversation (server tree); channel stays the parent,
+		 * for names, permissions and mentions */
+		channel_id = thread->id;
+	} else if (channel) {
 		channel_id = channel->id;
 	} else {
 		channel_id = id;
@@ -4877,8 +4897,8 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 		escaped_content = tmp;
 	}
 
-	/* Handle thread formatting */
-	if (thread) {
+	/* Handle thread formatting (inside the parent's conversation) */
+	if (thread && !da->native_meta) {
 		time_t ts = discord_time_from_snowflake(thread->id);
 		time_t msg_ts = discord_time_from_snowflake(msg_id);
 		const gchar *color = "#606060";
@@ -5358,6 +5378,9 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 			// Save the latest msg_id to the channel to help with history download
 			if (channel != NULL && msg_id > channel->last_message_id && !thread) {
 				channel->last_message_id = msg_id;
+			} else if (thread && da->native_meta && msg_id > thread->last_message_id) {
+				/* The thread's own conversation opens */
+				thread->last_message_id = msg_id;
 			}
 
 			gboolean fetched_history = discord_join_chat_by_id(da, channel_id, mentioned);
@@ -5491,8 +5514,10 @@ discord_process_message(DiscordAccount *da, JsonObject *data, unsigned special_t
 						gchar *escaped_msg_txt = purple_markup_escape_text(msg_txt, -1);
 						gchar *starter_txt = g_strdup_printf("%s%s: <font color=\"%s\">%s</font>", indicator, thread_ts, color, escaped_msg_txt);
 
-						/* channel may be unknown; thread->parent_id is the same room */
-						purple_serv_got_chat_in(da->pc, discord_chat_hash(thread->parent_id), tstart_username, tstart_flags, starter_txt, ref_timestamp);
+						/* channel may be unknown; thread->parent_id is the same room
+						 * (native: the thread's own conversation) */
+						purple_serv_got_chat_in(da->pc, discord_chat_hash(da->native_meta ? thread->id : thread->parent_id),
+						                        tstart_username, tstart_flags, starter_txt, ref_timestamp);
 
 						g_free(starter_txt);
 						g_free(escaped_msg_txt);
@@ -6390,6 +6415,11 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 
 		discord_process_message(da, data, msgtype);
 
+		if (msgtype == DISCORD_MESSAGE_NORMAL) {
+			/* The server tree's counts (native_meta) */
+			discord_tree_count_message(da, data);
+		}
+
 		const gchar *channel_id = json_object_get_string_member(data, "channel_id");
 
 		if (!channel_id) {
@@ -6428,6 +6458,12 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 	} else if (da->native_meta && purple_strequal(type, "MESSAGE_ACK")) {
 		/* Read on another client: the UI clears the unread state */
 		discord_native_message_ack(da, data);
+
+	} else if (da->native_meta && purple_strequal(type, "CHANNEL_UNREAD_UPDATE")) {
+		discord_tree_unread_update(da, data);
+
+	} else if (da->native_meta && purple_strequal(type, "USER_SETTINGS_UPDATE")) {
+		discord_tree_got_user_settings(da, data);
 
 	} else if (purple_strequal(type, "MESSAGE_DELETE") || purple_strequal(type, "MESSAGE_DELETE_BULK")) {
 
@@ -6568,7 +6604,8 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 		} else if (channel_type == CHANNEL_GROUP_DM) {
 			discord_got_group_dm(da, data);
 		} else if (channel_type == CHANNEL_GUILD_TEXT || channel_type == CHANNEL_GUILD_NEWS || DISCORD_CHANNEL_IS_THREAD(channel_type) ||
-				channel_type == CHANNEL_GUILD_FORUM || channel_type == CHANNEL_GUILD_MEDIA) {
+				channel_type == CHANNEL_GUILD_FORUM || channel_type == CHANNEL_GUILD_MEDIA ||
+				(da->native_meta && channel_type == CHANNEL_GUILD_CATEGORY)) {
 			const gchar *guild_id = json_object_get_string_member(data, "guild_id");
 			DiscordGuild *guild = discord_get_guild(da, to_int(guild_id));
 			if (guild != NULL) {
@@ -6579,6 +6616,7 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 					const gchar *parent_id = json_object_get_string_member(data, "parent_id");
 					DiscordChannel *parent = discord_get_channel_global_int(da, to_int(parent_id));
 					discord_add_thread(da, guild, parent, data, guild->id);
+					discord_tree_changed(da, guild->id);
 					return;
 				}
 
@@ -6589,7 +6627,10 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 					discord_add_permission_override(channel, permission_override);
 				}
 
+				discord_tree_changed(da, guild->id);
+
 				if (purple_account_is_connected(da->account)
+					&& channel_type != CHANNEL_GUILD_CATEGORY
 					&& purple_account_get_bool(da->account, "populate-blist", TRUE)
 					&& purple_blist_find_chat(da->account, channel_id) == NULL) {
 
@@ -6630,6 +6671,16 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 				purple_chat_conversation_set_topic(chatconv, NULL, new_topic);
 			}
 		}
+
+		if (da->native_meta) {
+			discord_tree_channel_update(da, data);
+		}
+	} else if (da->native_meta && (purple_strequal(type, "CHANNEL_DELETE") || purple_strequal(type, "THREAD_DELETE"))) {
+		discord_tree_channel_delete(da, data);
+
+	} else if (da->native_meta && purple_strequal(type, "GUILD_UPDATE")) {
+		discord_tree_guild_update(da, data);
+
 	} else if (purple_strequal(type, "THREAD_LIST_SYNC")) {
 		guint64 guild_id = to_int(json_object_get_string_member(data, "guild_id"));
 		DiscordGuild *guild = discord_get_guild(da, guild_id);
@@ -6650,6 +6701,8 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 				}
 			}
 		}
+
+		discord_tree_changed(da, guild_id);
 
 	} else if (purple_strequal(type, "RELATIONSHIP_ADD") || purple_strequal(type, "RELATIONSHIP_UPDATE")) {
 		discord_create_relationship(da, data);
@@ -6729,6 +6782,9 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 		discord_got_guilds(da, json_object_get_member(data, "guilds"), NULL);
 		discord_got_guild_settings(da, json_object_get_member(data, "user_guild_settings"));
 		discord_got_read_states(da, json_object_get_member(data, "read_state"), NULL);
+		/* The sidebar's guild order, and the server list is new (native_meta) */
+		discord_tree_got_user_settings(da, json_object_get_object_member(data, "user_settings"));
+		discord_tree_changed(da, 0);
 
 		/* Fetch our own avatar */
 		self_user_obj = discord_get_user(da, da->self_user_id);
@@ -6959,6 +7015,7 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 
 		g_hash_table_remove_int64(da->new_guilds, guild_id);
 		//TODO remove this guild's channels from the buddy list
+		discord_tree_changed(da, 0);
 
 	} else if (purple_strequal(type, "GUILD_MEMBER_ADD")) {
 		JsonObject *userdata = json_object_get_object_member(data, "user");
@@ -6988,6 +7045,11 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 		guint64 guild_id = to_int(json_object_get_string_member(data, "guild_id"));
 
 		discord_handle_guild_member_update(da, guild_id, data);
+
+		if (da->native_meta && to_int(json_object_get_string_member(json_object_get_object_member(data, "user"), "id")) == da->self_user_id) {
+			/* Our roles: what we can see */
+			discord_tree_changed(da, guild_id);
+		}
 
 	} else if (purple_strequal(type, "GUILD_MEMBER_REMOVE")) {
 		DiscordUser *user = discord_upsert_user(da->new_users, json_object_get_object_member(data, "user"));
@@ -7105,6 +7167,27 @@ discord_process_dispatch(DiscordAccount *da, const gchar *type, JsonObject *data
 
 		if (guild != NULL && role != NULL) {
 			discord_add_guild_role(guild, role);
+			discord_tree_changed(da, guild_id);
+		}
+
+	} else if (da->native_meta && (purple_strequal(type, "GUILD_ROLE_UPDATE") || purple_strequal(type, "GUILD_ROLE_DELETE"))) {
+		/* Permissions: what we can see in the server tree */
+		guint64 guild_id = to_int(json_object_get_string_member(data, "guild_id"));
+		DiscordGuild *guild = discord_get_guild(da, guild_id);
+
+		if (guild != NULL) {
+			if (purple_strequal(type, "GUILD_ROLE_UPDATE")) {
+				JsonObject *role = json_object_get_object_member(data, "role");
+
+				if (role != NULL) {
+					discord_add_guild_role(guild, role);
+				}
+			} else {
+				guint64 role_id = to_int(json_object_get_string_member(data, "role_id"));
+
+				g_hash_table_remove_int64(guild->roles, role_id);
+			}
+			discord_tree_changed(da, guild_id);
 		}
 
 	} else if (purple_strequal(type, "GUILD_EMOJIS_UPDATE")) {
@@ -7962,6 +8045,24 @@ discord_populate_guild(DiscordAccount *da, JsonObject *guild)
 	if (json_object_has_member(guild, "system_channel_id")) {
 		g->system_channel_id = to_int(json_object_get_string_member(guild, "system_channel_id"));
 	}
+
+	if (da->native_meta) {
+		/* The active threads we're in, for the server tree */
+		JsonArray *threads = json_object_get_array_member(guild, "threads");
+
+		for (int j = json_array_get_length(threads) - 1; j >= 0; j--) {
+			JsonObject *thread = json_array_get_object_element(threads, j);
+			guint64 parent_id = to_int(json_object_get_string_member(thread, "parent_id"));
+			DiscordChannel *parent = g_hash_table_lookup_int64(g->channels, parent_id);
+
+			if (thread != NULL && parent != NULL) {
+				discord_add_thread(da, g, parent, thread, g->id);
+			}
+		}
+
+		discord_tree_changed(da, g->id);
+		discord_tree_changed(da, 0);
+	}
 }
 
 static void
@@ -8186,6 +8287,19 @@ static void discord_set_room_last_id(DiscordAccount *da, guint64 channel_id, gui
 static void
 discord_got_read_states(DiscordAccount *da, JsonNode *node, gpointer user_data)
 {
+	if (da->native_meta && node != NULL) {
+		/* The server tree's read points and mention counts (a reconnect's
+		 * READY starts them afresh) */
+		JsonArray *entries = JSON_NODE_HOLDS_ARRAY(node) ? json_node_get_array(node) :
+			(JSON_NODE_HOLDS_OBJECT(node) ? json_object_get_array_member(json_node_get_object(node), "entries") : NULL);
+		guint n, entries_len = entries ? json_array_get_length(entries) : 0;
+
+		g_hash_table_remove_all(da->chan_state);
+		for (n = 0; n < entries_len; n++) {
+			discord_tree_got_read_state(da, json_array_get_object_element(entries, n));
+		}
+	}
+
 	JsonObject *data = json_node_get_object(node);
 	JsonArray *states = json_object_get_array_member(data, "entries");
 	guint len = json_array_get_length(states);
@@ -8292,6 +8406,35 @@ discord_got_guild_setting(DiscordAccount *da, JsonObject *settings)
 
 		if (level != NOTIFICATIONS_INHERIT)
 			channel->notification_level = level;
+	}
+
+	if (da->native_meta) {
+		/* For the server tree: the guild's own mute, and when mutes end */
+		JsonObject *mute_config = json_object_get_object_member(settings, "mute_config");
+		const gchar *end = mute_config ? json_object_get_string_member(mute_config, "end_time") : NULL;
+
+		guild->muted = all_mute;
+		guild->mute_end = end ? discord_str_to_time(end) : 0;
+
+		g_hash_table_iter_init(&iter, guild->channels);
+		while (g_hash_table_iter_next(&iter, &key, &value)) {
+			((DiscordChannel *) value)->mute_end = guild->mute_end;
+		}
+
+		for (int j = olen - 1; j >= 0; j--) {
+			JsonObject *override = json_array_get_object_element(overrides, j);
+			guint64 override_id = to_int(json_object_get_string_member(override, "channel_id"));
+			DiscordChannel *channel = g_hash_table_lookup_int64(guild->channels, override_id);
+			JsonObject *channel_mute = json_object_get_object_member(override, "mute_config");
+			const gchar *channel_end = channel_mute ? json_object_get_string_member(channel_mute, "end_time") : NULL;
+
+			if (channel != NULL) {
+				channel->mute_end = channel_end ? discord_str_to_time(channel_end) : 0;
+			}
+		}
+
+		discord_tree_changed(da, guild->id);
+		discord_tree_changed(da, 0);
 	}
 }
 
@@ -10755,6 +10898,11 @@ discord_open_chat(DiscordAccount *da, guint64 id, gboolean present)
 	DiscordGuild *guild = NULL;
 	DiscordChannel *channel = discord_get_channel_global_int_guild(da, id, &guild);
 
+	if (channel == NULL && da->native_meta) {
+		/* A thread's own conversation (server tree), titled with its name */
+		channel = discord_get_thread_global_int_guild(da, id, &guild);
+	}
+
 	if (channel == NULL) {
 		return NULL;
 	}
@@ -10800,8 +10948,9 @@ discord_open_chat(DiscordAccount *da, guint64 id, gboolean present)
 		purple_chat_conversation_set_nick(chatconv, name);
 		g_free(name);
 
-		/* Without this, an open guild channel gets no new messages live. */
-		discord_subscribe_channel(da, guild, id);
+		/* Without this, an open guild channel gets no new messages live.
+		 * (A thread: its parent's.) */
+		discord_subscribe_channel(da, guild, DISCORD_CHANNEL_IS_THREAD(channel->type) ? channel->parent_id : id);
 	}
 
 	return channel;
@@ -11391,6 +11540,11 @@ discord_chat_send(PurpleConnection *pc, gint id,
 	DiscordGuild *guild = NULL;
 	DiscordChannel *channel = discord_get_channel_global_int_guild(da, room_id, &guild);
 
+	if (channel == NULL && da->native_meta) {
+		/* A thread's own conversation */
+		channel = discord_get_thread_global_int_guild(da, room_id, &guild);
+	}
+
 	d_message = discord_make_mentions(da, guild, d_message);
 
 	if(guild) {
@@ -11404,7 +11558,7 @@ discord_chat_send(PurpleConnection *pc, gint id,
 		}
 	}
 
-	g_return_val_if_fail(discord_get_channel_global_int(da, room_id), -1); /* TODO rejoin room? */
+	g_return_val_if_fail(channel != NULL, -1); /* TODO rejoin room? */
 	ret = discord_conversation_send_message_full(da, room_id, d_message, NULL, da->native_meta);
 
 	/* Native: shown when the server echoes it, with its id */
@@ -12062,6 +12216,12 @@ discord_toggle_mute(PurpleBlistNode *node, gpointer userdata)
 	/* Toggle the mute */
 	channel->muted = !channel->muted;
 
+	if (da->native_meta) {
+		channel->mute_end = 0;
+		discord_tree_changed(da, channel->guild_id);
+		discord_tree_changed(da, 0);
+	}
+
 	/* PATCH /users/@me/guilds/[guild id]/settings
 	 * {"channel_overrides": {"channel_id": {"muted": true}}} */
 
@@ -12522,6 +12682,21 @@ void
 discord_manage_servers_cb(gpointer user_data, PurpleRequestFields *fields)
 {
 	DiscordAccount *da = user_data;
+
+	if (da->native_meta) {
+		/* Buddy List Abbreviations are the server tree's server names
+		 * (emitted once idle, after they are set below) */
+		GHashTableIter guild_iter;
+		gpointer guild_value;
+
+		g_hash_table_iter_init(&guild_iter, da->new_guilds);
+		while (g_hash_table_iter_next(&guild_iter, NULL, &guild_value)) {
+			if (guild_value != NULL) {
+				discord_tree_changed(da, ((DiscordGuild *) guild_value)->id);
+			}
+		}
+		discord_tree_changed(da, 0);
+	}
 
 
 	const GList *cur;
@@ -14009,8 +14184,10 @@ discord_ipc_room(DiscordAccount *da, const gchar *conv_name, DiscordGuild **guil
 		room_id = dm ? to_int(dm) : (str_is_number(conv_name) ? to_int(conv_name) : 0);
 	}
 
-	if (room_id != 0 && guild != NULL) {
-		discord_get_channel_global_int_guild(da, room_id, guild);
+	if (room_id != 0 && guild != NULL &&
+	    discord_get_channel_global_int_guild(da, room_id, guild) == NULL) {
+		/* A thread's own conversation */
+		discord_get_thread_global_int_guild(da, room_id, guild);
 	}
 
 	return room_id;
@@ -14372,6 +14549,1184 @@ discord_ipc_conversation_server(PurpleAccount *account, const gchar *conv_name, 
 	return TRUE;
 }
 
+/*
+ * Server tree (native_meta only)
+ *
+ * A message-meta UI (pidgin4) shows one window per server, with a sidebar
+ * tree of the server's channels and threads, unread and mention counts on
+ * each, and a badge per server. These IPC commands give it the structure and
+ * the counts, answered synchronously from the guild, channel and thread
+ * tables and the read state, with no network I/O:
+ *
+ *   gboolean server-list(PurpleAccount *, char **json)
+ *   gboolean server-tree(PurpleAccount *, const char *server_id, char **json)
+ *   gboolean channel-state(PurpleAccount *, const char *channel_id, char **json)
+ *   gboolean open-channel(PurpleAccount *, const char *channel_id)
+ *   gboolean mark-channel-read(PurpleAccount *, const char *channel_id)
+ *
+ * JSON comes back g_malloc'd (json-glib's generator) for the caller to
+ * g_free(); on FALSE the out-parameter is untouched. Like the other commands
+ * they return FALSE unless the account is a connected Discord account on a
+ * message-meta UI, and they only include what discord_is_channel_visible()
+ * lets our user see.
+ *
+ * Two signals on the plugin handle, registered and emitted only on a
+ * message-meta UI, each coalesced to one emission per guild (or channel) per
+ * main-loop idle:
+ *
+ *   void server-tree-changed(PurpleAccount *, const char *server_id)
+ *        server_id NULL: server-list changed (join, leave, rename, reorder)
+ *   void channel-state-changed(PurpleAccount *, const char *server_id, const char *channel_id)
+ *
+ * Counts (per channel or thread; a thread's messages count on the thread):
+ *   count     messages from others received live (MESSAGE_CREATE) since the
+ *             read point, shown or not;
+ *   more      unread there, number unknown: READY's read state had unread
+ *             messages (the channel's last_message_id > the read state's; a
+ *             channel without a read state entry is read up to when we joined
+ *             the guild, as the official client has it), or, live, a
+ *             CHANNEL_UNREAD_UPDATE (what Discord sends instead of
+ *             MESSAGE_CREATE for guilds the client isn't subscribed to) moved
+ *             the channel's last message past the read point;
+ *   mentions  READY's mention_count plus live messages that mention us
+ *             directly, a role we hold, or @everyone/@here unless suppressed;
+ *   unread    count > 0 || more.
+ * An ack resets all of them: ours (send-marker, mark-channel-read, a message
+ * we send there) or another client's MESSAGE_ACK. Muted channels count too;
+ * a mute with a mute_config end_time is over once that time has passed.
+ */
+
+typedef struct {
+	guint64 read_id;                /* the read point: READY's read state, then acks */
+	gboolean has_read_state;        /* READY's read_state had an entry for it */
+	gboolean read_since_login;      /* acked since: READY's read state no longer applies */
+	gboolean more_live;             /* a CHANNEL_UNREAD_UPDATE showed unread messages */
+	guint count;
+	guint mentions;
+	guint64 latest_id;              /* newest message seen live */
+} DiscordChanState;
+
+static DiscordChanState *
+discord_tree_state(DiscordAccount *da, guint64 channel_id, gboolean create)
+{
+	DiscordChanState *st = g_hash_table_lookup(da->chan_state, &channel_id);
+
+	if (st == NULL && create) {
+		st = g_new0(DiscordChanState, 1);
+		g_hash_table_replace(da->chan_state, g_memdup2(&channel_id, sizeof(guint64)), st);
+	}
+
+	return st;
+}
+
+static void
+discord_tree_init(DiscordAccount *da)
+{
+	da->chan_state = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
+	da->tree_pending = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+	da->state_pending = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
+	da->guild_order = g_array_new(FALSE, FALSE, sizeof(guint64));
+}
+
+static void
+discord_tree_free(DiscordAccount *da)
+{
+	if (da->tree_idle) {
+		purple_timeout_remove(da->tree_idle);
+		da->tree_idle = 0;
+	}
+
+	g_hash_table_destroy(da->chan_state);
+	g_hash_table_destroy(da->tree_pending);
+	g_hash_table_destroy(da->state_pending);
+	g_array_free(da->guild_order, TRUE);
+	da->chan_state = da->tree_pending = da->state_pending = NULL;
+	da->guild_order = NULL;
+}
+
+/* A guild channel or thread by id, with its guild and, for a thread, its
+ * parent channel. NULL for unknown ids, DMs and group DMs. */
+static DiscordChannel *
+discord_tree_lookup(DiscordAccount *da, guint64 id, DiscordGuild **o_guild, DiscordChannel **o_parent)
+{
+	DiscordGuild *guild = NULL;
+	DiscordChannel *parent = NULL;
+	DiscordChannel *channel = discord_get_channel_global_int_guild(da, id, &guild);
+
+	if (channel == NULL) {
+		channel = discord_get_thread_global_int_guild(da, id, &guild);
+
+		if (channel != NULL && guild != NULL) {
+			parent = g_hash_table_lookup_int64(guild->channels, channel->parent_id);
+		}
+	}
+
+	if (channel == NULL || guild == NULL) {
+		return NULL;
+	}
+
+	if (o_guild != NULL) {
+		*o_guild = guild;
+	}
+	if (o_parent != NULL) {
+		*o_parent = parent;
+	}
+
+	return channel;
+}
+
+static const gchar *
+discord_tree_type_name(DiscordChannelType type)
+{
+	switch (type) {
+		case CHANNEL_GUILD_CATEGORY: return "category";
+		case CHANNEL_GUILD_TEXT: return "text";
+		case CHANNEL_GUILD_NEWS: return "news";
+		case CHANNEL_GUILD_FORUM: return "forum";
+		case CHANNEL_GUILD_MEDIA: return "media";
+		case CHANNEL_GUILD_NEWS_THREAD:
+		case CHANNEL_GUILD_PUBLIC_THREAD:
+		case CHANNEL_GUILD_PRIVATE_THREAD: return "thread";
+		default: return NULL;   /* voice, stage and the rest are left out */
+	}
+}
+
+/* Has a conversation of its own: text and news channels, and threads */
+static gboolean
+discord_tree_openable(DiscordChannel *channel)
+{
+	return channel->type == CHANNEL_GUILD_TEXT || channel->type == CHANNEL_GUILD_NEWS ||
+	       DISCORD_CHANNEL_IS_THREAD(channel->type);
+}
+
+/* In the tree for our user. Categories are shown when they have a child
+ * that is; a thread when its parent is. */
+static gboolean
+discord_tree_visible(DiscordAccount *da, DiscordChannel *channel, DiscordChannel *parent)
+{
+	if (DISCORD_CHANNEL_IS_THREAD(channel->type)) {
+		return parent != NULL && discord_tree_visible(da, parent, NULL);
+	}
+
+	if (channel->type == CHANNEL_GUILD_CATEGORY || discord_tree_type_name(channel->type) == NULL) {
+		return FALSE;
+	}
+
+	return discord_is_channel_visible(da, discord_get_user(da, da->self_user_id), channel);
+}
+
+static guint64
+discord_tree_latest(DiscordChannel *channel, DiscordChanState *st)
+{
+	return MAX(channel->last_message_id, st != NULL ? st->latest_id : 0);
+}
+
+/* Unread, number unknown (see "more" above) */
+static gboolean
+discord_tree_more(DiscordAccount *da, DiscordChannel *channel, DiscordChanState *st)
+{
+	DiscordGuild *guild;
+	DiscordUser *self;
+	DiscordGuildMembership *membership;
+	time_t read_until;
+
+	if (st != NULL && (st->more_live || st->read_since_login)) {
+		return st->more_live;
+	}
+
+	if (channel->login_last_message_id == 0) {
+		return FALSE;
+	}
+
+	if (st != NULL && st->has_read_state) {
+		return channel->login_last_message_id > st->read_id;
+	}
+
+	if (DISCORD_CHANNEL_IS_THREAD(channel->type)) {
+		/* We don't know when we joined it: count only what arrives live */
+		return FALSE;
+	}
+
+	/* No read state entry: read up to when we joined the guild (else the
+	 * channel's creation), as the official client has it */
+	guild = discord_get_guild(da, channel->guild_id);
+	self = discord_get_user(da, da->self_user_id);
+	membership = (guild != NULL && self != NULL) ? g_hash_table_lookup_int64(self->guild_memberships, guild->id) : NULL;
+	read_until = (membership != NULL && membership->joined_at != NULL) ?
+		discord_str_to_time(membership->joined_at) : discord_time_from_snowflake(channel->id);
+
+	return discord_time_from_snowflake(channel->login_last_message_id) > read_until;
+}
+
+/* A mute that is on: mute_config's end_time, if any, hasn't passed */
+static gboolean
+discord_tree_mute_active(gboolean muted, gint64 mute_end)
+{
+	return muted && (mute_end == 0 || mute_end > (gint64) time(NULL));
+}
+
+static gboolean
+discord_tree_muted(DiscordChannel *channel, DiscordChannel *parent)
+{
+	return discord_tree_mute_active(channel->muted, channel->mute_end) ||
+	       (parent != NULL && discord_tree_mute_active(parent->muted, parent->mute_end));
+}
+
+/* The channel-state fields, on @obj */
+static void
+discord_tree_state_members(DiscordAccount *da, JsonObject *obj, DiscordChannel *channel, DiscordChanState *st)
+{
+	guint count = st != NULL ? st->count : 0;
+	gboolean more = discord_tree_more(da, channel, st);
+
+	json_object_set_boolean_member(obj, "unread", count > 0 || more);
+	json_object_set_int_member(obj, "count", count);
+	json_object_set_boolean_member(obj, "more", more);
+	json_object_set_int_member(obj, "mentions", st != NULL ? st->mentions : 0);
+}
+
+/* @root as a g_malloc'd string; takes @root */
+static gchar *
+discord_tree_json(JsonNode *root)
+{
+	JsonGenerator *generator = json_generator_new();
+	gchar *str;
+
+	json_generator_set_root(generator, root);
+	str = json_generator_to_data(generator, NULL);
+	g_object_unref(generator);
+	json_node_free(root);
+
+	return str;
+}
+
+static void
+discord_tree_set_id(JsonObject *obj, const gchar *member, guint64 id)
+{
+	if (id != 0) {
+		gchar *s = from_int(id);
+
+		json_object_set_string_member(obj, member, s);
+		g_free(s);
+	} else {
+		json_object_set_null_member(obj, member);
+	}
+}
+
+/* ---- signals ---- */
+
+static gboolean
+discord_tree_emit_cb(gpointer data)
+{
+	DiscordAccount *da = data;
+	GHashTable *trees = da->tree_pending;
+	GHashTable *states = da->state_pending;
+	GHashTableIter iter;
+	gpointer key, value;
+
+	da->tree_idle = 0;
+	/* Fresh tables, in case a handler makes more changes */
+	da->tree_pending = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+	da->state_pending = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
+
+	if (discord_plugin_handle != NULL) {
+		g_hash_table_iter_init(&iter, trees);
+		while (g_hash_table_iter_next(&iter, &key, NULL)) {
+			guint64 guild_id = *(guint64 *) key;
+			gchar *guild_id_s = guild_id ? from_int(guild_id) : NULL;
+
+			purple_signal_emit(discord_plugin_handle, "server-tree-changed", da->account, guild_id_s);
+			g_free(guild_id_s);
+		}
+
+		g_hash_table_iter_init(&iter, states);
+		while (g_hash_table_iter_next(&iter, &key, &value)) {
+			gchar *guild_id_s = from_int(*(guint64 *) value);
+			gchar *channel_id_s = from_int(*(guint64 *) key);
+
+			purple_signal_emit(discord_plugin_handle, "channel-state-changed", da->account, guild_id_s, channel_id_s);
+			g_free(guild_id_s);
+			g_free(channel_id_s);
+		}
+	}
+
+	g_hash_table_destroy(trees);
+	g_hash_table_destroy(states);
+	return FALSE;
+}
+
+static void
+discord_tree_schedule(DiscordAccount *da)
+{
+	if (da->tree_idle == 0) {
+		da->tree_idle = purple_timeout_add(0, discord_tree_emit_cb, da);
+	}
+}
+
+/* server-tree-changed for @guild_id (0: server-list changed), once per idle */
+static void
+discord_tree_changed(DiscordAccount *da, guint64 guild_id)
+{
+	if (!da->native_meta || discord_plugin_handle == NULL) {
+		return;
+	}
+
+	g_hash_table_add(da->tree_pending, g_memdup2(&guild_id, sizeof(guint64)));
+	discord_tree_schedule(da);
+}
+
+/* channel-state-changed for @channel_id, once per idle */
+static void
+discord_tree_state_changed(DiscordAccount *da, guint64 guild_id, guint64 channel_id)
+{
+	if (!da->native_meta || discord_plugin_handle == NULL) {
+		return;
+	}
+
+	g_hash_table_replace(da->state_pending, g_memdup2(&channel_id, sizeof(guint64)),
+	                     g_memdup2(&guild_id, sizeof(guint64)));
+	discord_tree_schedule(da);
+}
+
+/* ---- counting ---- */
+
+/* Message @data mentions us: directly, by a role we hold, or by @everyone or
+ * @here unless @channel suppresses those */
+static gboolean
+discord_tree_mentions_me(DiscordAccount *da, JsonObject *data, DiscordGuild *guild, DiscordChannel *channel)
+{
+	JsonArray *mentions = json_object_get_array_member(data, "mentions");
+	JsonArray *mention_roles = json_object_get_array_member(data, "mention_roles");
+	guint i, len;
+
+	if (json_object_get_boolean_member(data, "mention_everyone") && !(channel != NULL && channel->suppress_everyone)) {
+		return TRUE;
+	}
+
+	len = mentions ? json_array_get_length(mentions) : 0;
+	for (i = 0; i < len; i++) {
+		JsonObject *user = json_array_get_object_element(mentions, i);
+
+		if (user != NULL && to_int(json_object_get_string_member(user, "id")) == da->self_user_id) {
+			return TRUE;
+		}
+	}
+
+	len = mention_roles ? json_array_get_length(mention_roles) : 0;
+	if (len > 0 && guild != NULL) {
+		DiscordUser *self = discord_get_user(da, da->self_user_id);
+		DiscordGuildMembership *membership = self ? g_hash_table_lookup_int64(self->guild_memberships, guild->id) : NULL;
+
+		for (i = 0; membership != NULL && i < len; i++) {
+			guint64 role_id = to_int(json_array_get_string_element(mention_roles, i));
+			guint j;
+
+			for (j = 0; j < membership->roles->len; j++) {
+				if (g_array_index(membership->roles, guint64, j) == role_id) {
+					return TRUE;
+				}
+			}
+		}
+	}
+
+	return FALSE;
+}
+
+/* A live MESSAGE_CREATE: counts it on its channel or thread */
+static void
+discord_tree_count_message(DiscordAccount *da, JsonObject *data)
+{
+	DiscordGuild *guild = NULL;
+	DiscordChannel *parent = NULL;
+	DiscordChannel *channel;
+	DiscordChanState *st;
+	JsonObject *author;
+	guint64 msg_id, channel_id;
+
+	if (!da->native_meta) {
+		return;
+	}
+
+	msg_id = to_int(json_object_get_string_member(data, "id"));
+	channel_id = to_int(json_object_get_string_member(data, "channel_id"));
+	channel = discord_tree_lookup(da, channel_id, &guild, &parent);
+
+	if (channel == NULL || msg_id == 0) {
+		return;
+	}
+
+	st = discord_tree_state(da, channel_id, TRUE);
+	if (msg_id > st->latest_id) {
+		st->latest_id = msg_id;
+	}
+
+	author = json_object_get_object_member(data, "author");
+	if (author != NULL && to_int(json_object_get_string_member(author, "id")) == da->self_user_id) {
+		/* We posted there: read up to here (Discord acks our own messages) */
+		if (!discord_native_read_set(da, channel_id, msg_id)) {
+			discord_tree_read(da, channel_id, msg_id);
+		}
+		return;
+	}
+
+	if (msg_id <= MAX(st->read_id, discord_native_read_get(da, channel_id))) {
+		return;
+	}
+
+	st->count++;
+	if (discord_tree_mentions_me(da, data, guild, parent != NULL ? parent : channel)) {
+		st->mentions++;
+	}
+
+	discord_tree_state_changed(da, guild->id, channel_id);
+}
+
+/* @channel_id is read up to @msg_id (an ack, ours or another client's):
+ * resets its counts */
+static void
+discord_tree_read(DiscordAccount *da, guint64 channel_id, guint64 msg_id)
+{
+	DiscordGuild *guild = NULL;
+	DiscordChannel *channel;
+	DiscordChanState *st;
+	gboolean changed;
+
+	if (!da->native_meta) {
+		return;
+	}
+
+	channel = discord_tree_lookup(da, channel_id, &guild, NULL);
+	if (channel == NULL) {
+		return;
+	}
+
+	st = discord_tree_state(da, channel_id, TRUE);
+	changed = st->count > 0 || st->mentions > 0 || discord_tree_more(da, channel, st);
+
+	st->count = 0;
+	st->mentions = 0;
+	st->read_since_login = TRUE;
+	st->more_live = FALSE;
+	if (msg_id > st->read_id) {
+		st->read_id = msg_id;
+	}
+
+	if (changed) {
+		discord_tree_state_changed(da, guild->id, channel_id);
+	}
+}
+
+/* One entry of READY's read_state */
+static void
+discord_tree_got_read_state(DiscordAccount *da, JsonObject *state)
+{
+	DiscordChanState *st;
+	guint64 id;
+
+	if (!da->native_meta || state == NULL) {
+		return;
+	}
+
+	if (json_object_has_member(state, "read_state_type") && json_object_get_int_member(state, "read_state_type") != 0) {
+		/* Not a channel's (NON_CHANNEL_READ_STATES) */
+		return;
+	}
+
+	id = to_int(json_object_get_string_member(state, "id"));
+	if (id == 0) {
+		return;
+	}
+
+	st = discord_tree_state(da, id, TRUE);
+	st->has_read_state = TRUE;
+	st->read_since_login = FALSE;
+	st->more_live = FALSE;
+	/* One or the other */
+	st->read_id = to_int(json_object_has_member(state, "last_message_id") ?
+		json_object_get_string_member(state, "last_message_id") :
+		json_object_get_string_member(state, "last_acked_id"));
+	st->mentions = MAX(json_object_get_int_member(state, "mention_count"), 0);
+	st->count = 0;
+}
+
+/* CHANNEL_UNREAD_UPDATE: new last messages in a guild we aren't subscribed
+ * to, which sends no MESSAGE_CREATE for them. Unread, number unknown. */
+static void
+discord_tree_unread_update(DiscordAccount *da, JsonObject *data)
+{
+	JsonArray *updates = json_object_get_array_member(data, "channel_unread_updates");
+	guint i, len = updates ? json_array_get_length(updates) : 0;
+
+	if (!da->native_meta) {
+		return;
+	}
+
+	for (i = 0; i < len; i++) {
+		JsonObject *update = json_array_get_object_element(updates, i);
+		DiscordGuild *guild = NULL;
+		DiscordChannel *channel;
+		DiscordChanState *st;
+		guint64 id, last;
+
+		if (update == NULL) {
+			continue;
+		}
+
+		id = to_int(json_object_get_string_member(update, "id"));
+		last = to_int(json_object_get_string_member(update, "last_message_id"));
+		channel = discord_tree_lookup(da, id, &guild, NULL);
+
+		if (channel == NULL || last == 0) {
+			continue;
+		}
+
+		st = discord_tree_state(da, id, TRUE);
+		if (last > st->latest_id) {
+			st->latest_id = last;
+		}
+
+		if (!st->more_live && last > MAX(st->read_id, discord_native_read_get(da, id))) {
+			st->more_live = TRUE;
+			discord_tree_state_changed(da, guild->id, id);
+		}
+	}
+}
+
+/* READY's user_settings or USER_SETTINGS_UPDATE: the guild order */
+static void
+discord_tree_got_user_settings(DiscordAccount *da, JsonObject *settings)
+{
+	JsonArray *folders, *positions;
+	guint i, j;
+
+	if (!da->native_meta || settings == NULL) {
+		return;
+	}
+
+	folders = json_object_get_array_member(settings, "guild_folders");
+	positions = json_object_get_array_member(settings, "guild_positions");
+
+	if (folders == NULL && positions == NULL) {
+		/* A change to other settings */
+		return;
+	}
+
+	g_array_set_size(da->guild_order, 0);
+
+	if (folders != NULL) {
+		for (i = 0; i < json_array_get_length(folders); i++) {
+			JsonObject *folder = json_array_get_object_element(folders, i);
+			JsonArray *ids = folder ? json_object_get_array_member(folder, "guild_ids") : NULL;
+
+			for (j = 0; ids != NULL && j < json_array_get_length(ids); j++) {
+				guint64 id = to_int(json_array_get_string_element(ids, j));
+
+				g_array_append_val(da->guild_order, id);
+			}
+		}
+	} else {
+		for (i = 0; i < json_array_get_length(positions); i++) {
+			guint64 id = to_int(json_array_get_string_element(positions, i));
+
+			g_array_append_val(da->guild_order, id);
+		}
+	}
+
+	discord_tree_changed(da, 0);
+}
+
+/* ---- the server list ---- */
+
+typedef struct {
+	DiscordGuild *guild;
+	guint rank;                     /* in guild_order, else G_MAXUINT */
+	const gchar *joined_at;         /* our membership's, for the rest */
+} DiscordTreeGuild;
+
+static gint
+discord_tree_guild_cmp(gconstpointer a, gconstpointer b)
+{
+	const DiscordTreeGuild *x = a, *y = b;
+	gint c;
+
+	if (x->rank != y->rank) {
+		return x->rank < y->rank ? -1 : 1;
+	}
+
+	/* Join order: ISO 8601 timestamps sort as strings */
+	c = g_strcmp0(x->joined_at, y->joined_at);
+	if (c != 0) {
+		return c;
+	}
+
+	return x->guild->id < y->guild->id ? -1 : (x->guild->id > y->guild->id ? 1 : 0);
+}
+
+/* The account's guilds in the client's sidebar order: guild_folders or
+ * guild_positions from READY's user_settings, then the rest in join order */
+static GArray *
+discord_tree_guilds(DiscordAccount *da)
+{
+	GArray *list = g_array_new(FALSE, FALSE, sizeof(DiscordTreeGuild));
+	DiscordUser *self = discord_get_user(da, da->self_user_id);
+	GHashTableIter iter;
+	gpointer value;
+
+	g_hash_table_iter_init(&iter, da->new_guilds);
+	while (g_hash_table_iter_next(&iter, NULL, &value)) {
+		DiscordTreeGuild entry = { value, G_MAXUINT, NULL };
+		DiscordGuildMembership *membership;
+		guint i;
+
+		if (entry.guild == NULL) {
+			continue;
+		}
+
+		for (i = 0; i < da->guild_order->len; i++) {
+			if (g_array_index(da->guild_order, guint64, i) == entry.guild->id) {
+				entry.rank = i;
+				break;
+			}
+		}
+
+		membership = self ? g_hash_table_lookup_int64(self->guild_memberships, entry.guild->id) : NULL;
+		entry.joined_at = membership ? membership->joined_at : NULL;
+		g_array_append_val(list, entry);
+	}
+
+	g_array_sort(list, discord_tree_guild_cmp);
+	return list;
+}
+
+/* A guild's badge: any unread, and the mentions, of its non-muted visible
+ * channels and threads */
+static void
+discord_tree_guild_badge(DiscordAccount *da, DiscordGuild *guild, gboolean *unread, gint64 *mentions)
+{
+	GHashTableIter iter;
+	gpointer value;
+
+	*unread = FALSE;
+	*mentions = 0;
+
+	g_hash_table_iter_init(&iter, guild->channels);
+	while (g_hash_table_iter_next(&iter, NULL, &value)) {
+		DiscordChannel *channel = value;
+		DiscordChanState *st;
+
+		if (!discord_tree_openable(channel) || discord_tree_muted(channel, NULL) || !discord_tree_visible(da, channel, NULL)) {
+			continue;
+		}
+
+		st = discord_tree_state(da, channel->id, FALSE);
+		*unread = *unread || (st != NULL && st->count > 0) || discord_tree_more(da, channel, st);
+		*mentions += st != NULL ? st->mentions : 0;
+	}
+
+	g_hash_table_iter_init(&iter, guild->threads);
+	while (g_hash_table_iter_next(&iter, NULL, &value)) {
+		DiscordChannel *thread = value;
+		DiscordChannel *parent = g_hash_table_lookup_int64(guild->channels, thread->parent_id);
+		DiscordChanState *st;
+
+		if (discord_tree_muted(thread, parent) || !discord_tree_visible(da, thread, parent)) {
+			continue;
+		}
+
+		st = discord_tree_state(da, thread->id, FALSE);
+		*unread = *unread || (st != NULL && st->count > 0) || discord_tree_more(da, thread, st);
+		*mentions += st != NULL ? st->mentions : 0;
+	}
+}
+
+/*
+ * gboolean server-list(PurpleAccount *, char **json)
+ *
+ * [{"id", "name", "icon" (CDN URL or null), "unread", "mentions", "muted"}]
+ * in the client's sidebar order.
+ */
+static gboolean
+discord_ipc_server_list(PurpleAccount *account, gchar **json)
+{
+	DiscordAccount *da = discord_ipc_account(account);
+	JsonArray *array;
+	JsonNode *root;
+	GArray *guilds;
+	guint i;
+
+	if (da == NULL || json == NULL) {
+		return FALSE;
+	}
+
+	array = json_array_new();
+	guilds = discord_tree_guilds(da);
+
+	for (i = 0; i < guilds->len; i++) {
+		DiscordGuild *guild = g_array_index(guilds, DiscordTreeGuild, i).guild;
+		JsonObject *obj = json_object_new();
+		gboolean unread;
+		gint64 mentions;
+
+		discord_tree_set_id(obj, "id", guild->id);
+		json_object_set_string_member(obj, "name", discord_ipc_server_name(da, guild));
+
+		if (guild->icon != NULL && *guild->icon != '\0') {
+			gchar *url = g_strdup_printf("https://" DISCORD_CDN_SERVER "/icons/%" G_GUINT64_FORMAT "/%s.%s",
+			                             guild->id, guild->icon, g_str_has_prefix(guild->icon, "a_") ? "gif" : "png");
+
+			json_object_set_string_member(obj, "icon", url);
+			g_free(url);
+		} else {
+			json_object_set_null_member(obj, "icon");
+		}
+
+		discord_tree_guild_badge(da, guild, &unread, &mentions);
+		json_object_set_boolean_member(obj, "unread", unread);
+		json_object_set_int_member(obj, "mentions", mentions);
+		json_object_set_boolean_member(obj, "muted", discord_tree_mute_active(guild->muted, guild->mute_end));
+		json_array_add_object_element(array, obj);
+	}
+
+	g_array_free(guilds, TRUE);
+	root = json_node_new(JSON_NODE_ARRAY);
+	json_node_take_array(root, array);
+	*json = discord_tree_json(root);
+	return TRUE;
+}
+
+/* ---- one server's tree ---- */
+
+/* Discord's order within a level: position, then id */
+static gint
+discord_tree_position_cmp(gconstpointer a, gconstpointer b)
+{
+	const DiscordChannel *x = a, *y = b;
+
+	if (x->position != y->position) {
+		return x->position < y->position ? -1 : 1;
+	}
+
+	return x->id < y->id ? -1 : (x->id > y->id ? 1 : 0);
+}
+
+static gint
+discord_tree_activity_cmp(gconstpointer a, gconstpointer b, gpointer user_data)
+{
+	DiscordAccount *da = user_data;
+	const DiscordChannel *x = a, *y = b;
+	guint64 ax = MAX(discord_tree_latest((DiscordChannel *) x, discord_tree_state(da, x->id, FALSE)), x->id);
+	guint64 ay = MAX(discord_tree_latest((DiscordChannel *) y, discord_tree_state(da, y->id, FALSE)), y->id);
+
+	/* Newest activity first */
+	if (ax != ay) {
+		return ax > ay ? -1 : 1;
+	}
+
+	return x->id > y->id ? -1 : (x->id < y->id ? 1 : 0);
+}
+
+static JsonObject *
+discord_tree_node(DiscordAccount *da, DiscordChannel *channel, DiscordChannel *parent, guint64 parent_id)
+{
+	JsonObject *obj = json_object_new();
+	gboolean thread = DISCORD_CHANNEL_IS_THREAD(channel->type);
+	DiscordChanState *st = discord_tree_state(da, channel->id, FALSE);
+
+	discord_tree_set_id(obj, "id", channel->id);
+	json_object_set_string_member(obj, "name", channel->name ? channel->name : "");
+	json_object_set_string_member(obj, "type", discord_tree_type_name(channel->type));
+	discord_tree_set_id(obj, "parent", parent_id);
+	json_object_set_boolean_member(obj, "openable", discord_tree_openable(channel));
+
+	if (!thread && channel->topic != NULL && *channel->topic != '\0') {
+		json_object_set_string_member(obj, "topic", channel->topic);
+	} else {
+		json_object_set_null_member(obj, "topic");
+	}
+
+	json_object_set_boolean_member(obj, "nsfw", channel->nsfw || (thread && parent != NULL && parent->nsfw));
+	json_object_set_boolean_member(obj, "muted", discord_tree_muted(channel, thread ? parent : NULL));
+	if (thread) {
+		json_object_set_boolean_member(obj, "archived", channel->archived);
+	}
+	discord_tree_set_id(obj, "last_message_id", discord_tree_latest(channel, st));
+	discord_tree_state_members(da, obj, channel, st);
+
+	return obj;
+}
+
+/* Sets @list as @id's in @table (keys g_free'd, values g_list_free'd)
+ * without freeing the list it had, which @list may contain */
+static void
+discord_tree_set_list(GHashTable *table, guint64 id, GList *list)
+{
+	gpointer key = NULL;
+
+	if (!g_hash_table_steal_extended(table, &id, &key, NULL)) {
+		key = g_memdup2(&id, sizeof(guint64));
+	}
+
+	g_hash_table_insert(table, key, list);
+}
+
+/* @channel's node, then its threads, newest activity first */
+static void
+discord_tree_add_channel(DiscordAccount *da, JsonArray *array, GHashTable *threads_of,
+                         DiscordChannel *channel, guint64 parent_id)
+{
+	GList *threads = g_hash_table_lookup(threads_of, &channel->id);
+	GList *l;
+
+	json_array_add_object_element(array, discord_tree_node(da, channel, NULL, parent_id));
+
+	threads = g_list_sort_with_data(threads, discord_tree_activity_cmp, da);
+	discord_tree_set_list(threads_of, channel->id, threads);
+
+	for (l = threads; l != NULL; l = l->next) {
+		json_array_add_object_element(array, discord_tree_node(da, l->data, channel, channel->id));
+	}
+}
+
+/*
+ * gboolean server-tree(PurpleAccount *, const char *server_id, char **json)
+ *
+ * {"id", "name", "channels": [...]}: a flat array in display order (the
+ * channels outside categories, then each category with its channels, each
+ * channel followed by its threads). Each node is {"id", "name", "type",
+ * "parent", "openable", "topic", "nsfw", "muted", "archived" (threads),
+ * "last_message_id"} plus the channel-state fields.
+ */
+static gboolean
+discord_ipc_server_tree(PurpleAccount *account, const gchar *server_id, gchar **json)
+{
+	DiscordAccount *da = discord_ipc_account(account);
+	DiscordGuild *guild;
+	GHashTable *children, *threads_of;
+	GList *top = NULL, *categories = NULL, *l, *m;
+	GHashTableIter iter;
+	gpointer value;
+	JsonObject *obj;
+	JsonArray *array;
+	JsonNode *root;
+
+	if (da == NULL || json == NULL || server_id == NULL || !str_is_number(server_id) ||
+	    (guild = discord_get_guild(da, to_int(server_id))) == NULL) {
+		return FALSE;
+	}
+
+	/* category id -> its visible channels; channel id -> its threads */
+	children = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, (GDestroyNotify) g_list_free);
+	threads_of = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, (GDestroyNotify) g_list_free);
+
+	g_hash_table_iter_init(&iter, guild->channels);
+	while (g_hash_table_iter_next(&iter, NULL, &value)) {
+		DiscordChannel *channel = value;
+		DiscordChannel *category;
+
+		if (channel->type == CHANNEL_GUILD_CATEGORY) {
+			categories = g_list_prepend(categories, channel);
+			continue;
+		}
+
+		if (!discord_tree_visible(da, channel, NULL)) {
+			continue;
+		}
+
+		category = channel->parent_id ? g_hash_table_lookup_int64(guild->channels, channel->parent_id) : NULL;
+
+		if (category != NULL && category->type == CHANNEL_GUILD_CATEGORY) {
+			discord_tree_set_list(children, category->id,
+				g_list_prepend(g_hash_table_lookup(children, &category->id), channel));
+		} else {
+			top = g_list_prepend(top, channel);
+		}
+	}
+
+	g_hash_table_iter_init(&iter, guild->threads);
+	while (g_hash_table_iter_next(&iter, NULL, &value)) {
+		DiscordChannel *thread = value;
+		DiscordChannel *parent = g_hash_table_lookup_int64(guild->channels, thread->parent_id);
+		if (!discord_tree_visible(da, thread, parent)) {
+			continue;
+		}
+
+		discord_tree_set_list(threads_of, parent->id,
+			g_list_prepend(g_hash_table_lookup(threads_of, &parent->id), thread));
+	}
+
+	array = json_array_new();
+
+	top = g_list_sort(top, discord_tree_position_cmp);
+	for (l = top; l != NULL; l = l->next) {
+		discord_tree_add_channel(da, array, threads_of, l->data, 0);
+	}
+
+	categories = g_list_sort(categories, discord_tree_position_cmp);
+	for (l = categories; l != NULL; l = l->next) {
+		DiscordChannel *category = l->data;
+		GList *list = g_hash_table_lookup(children, &category->id);
+
+		if (list == NULL) {
+			/* Nothing in it we can see */
+			continue;
+		}
+
+		list = g_list_sort(list, discord_tree_position_cmp);
+		discord_tree_set_list(children, category->id, list);
+
+		json_array_add_object_element(array, discord_tree_node(da, category, NULL, 0));
+		for (m = list; m != NULL; m = m->next) {
+			discord_tree_add_channel(da, array, threads_of, m->data, category->id);
+		}
+	}
+
+	g_list_free(top);
+	g_list_free(categories);
+	g_hash_table_destroy(children);
+	g_hash_table_destroy(threads_of);
+
+	obj = json_object_new();
+	discord_tree_set_id(obj, "id", guild->id);
+	json_object_set_string_member(obj, "name", discord_ipc_server_name(da, guild));
+	json_object_set_array_member(obj, "channels", array);
+	root = json_node_new(JSON_NODE_OBJECT);
+	json_node_take_object(root, obj);
+	*json = discord_tree_json(root);
+	return TRUE;
+}
+
+/* A visible guild channel or thread of the tree, by its id string */
+static DiscordChannel *
+discord_tree_ipc_channel(DiscordAccount *da, const gchar *channel_id, DiscordGuild **guild)
+{
+	DiscordChannel *parent = NULL;
+	DiscordChannel *channel;
+
+	if (channel_id == NULL || !str_is_number(channel_id)) {
+		return NULL;
+	}
+
+	channel = discord_tree_lookup(da, to_int(channel_id), guild, &parent);
+
+	if (channel == NULL || !discord_tree_visible(da, channel, parent)) {
+		return NULL;
+	}
+
+	return channel;
+}
+
+/*
+ * gboolean channel-state(PurpleAccount *, const char *channel_id, char **json)
+ *
+ * {"unread", "count", "more", "mentions"} of a guild channel or thread.
+ */
+static gboolean
+discord_ipc_channel_state(PurpleAccount *account, const gchar *channel_id, gchar **json)
+{
+	DiscordAccount *da = discord_ipc_account(account);
+	DiscordChannel *channel;
+	JsonObject *obj;
+	JsonNode *root;
+
+	if (da == NULL || json == NULL || (channel = discord_tree_ipc_channel(da, channel_id, NULL)) == NULL) {
+		return FALSE;
+	}
+
+	obj = json_object_new();
+	discord_tree_state_members(da, obj, channel, discord_tree_state(da, channel->id, FALSE));
+	root = json_node_new(JSON_NODE_OBJECT);
+	json_node_take_object(root, obj);
+	*json = discord_tree_json(root);
+	return TRUE;
+}
+
+/*
+ * gboolean open-channel(PurpleAccount *, const char *channel_id)
+ *
+ * Opens and presents a channel's or thread's conversation (named by its id),
+ * with its history, as joining it from the buddy list does. FALSE for
+ * unknown ids and ones without a conversation (categories, forums).
+ */
+static gboolean
+discord_ipc_open_channel(PurpleAccount *account, const gchar *channel_id)
+{
+	DiscordAccount *da = discord_ipc_account(account);
+	DiscordChannel *channel;
+
+	if (da == NULL || (channel = discord_tree_ipc_channel(da, channel_id, NULL)) == NULL ||
+	    !discord_tree_openable(channel)) {
+		return FALSE;
+	}
+
+	discord_join_chat_by_id(da, channel->id, TRUE);
+	return TRUE;
+}
+
+/*
+ * gboolean mark-channel-read(PurpleAccount *, const char *channel_id)
+ *
+ * Acks the newest message of a channel or thread, as send-marker does, and
+ * resets its counts.
+ */
+static gboolean
+discord_ipc_mark_channel_read(PurpleAccount *account, const gchar *channel_id)
+{
+	DiscordAccount *da = discord_ipc_account(account);
+	DiscordChannel *channel;
+	guint64 latest;
+
+	if (da == NULL || (channel = discord_tree_ipc_channel(da, channel_id, NULL)) == NULL ||
+	    !discord_tree_openable(channel)) {
+		return FALSE;
+	}
+
+	latest = discord_tree_latest(channel, discord_tree_state(da, channel->id, FALSE));
+
+	if (latest != 0) {
+		discord_native_ack_message(da, channel->id, latest);
+	}
+
+	/* Also when it was acked already, for "more" */
+	discord_tree_read(da, channel->id, latest);
+	return TRUE;
+}
+
+/* ---- structure changes (native_meta) ---- */
+
+/* CHANNEL_UPDATE or THREAD_UPDATE: what the tree shows. (Channel names are
+ * updated for every UI by the dispatcher.) */
+static void
+discord_tree_channel_update(DiscordAccount *da, JsonObject *data)
+{
+	guint64 id = to_int(json_object_get_string_member(data, "id"));
+	gint64 type = json_object_get_int_member(data, "type");
+	DiscordGuild *guild = discord_get_guild(da, to_int(json_object_get_string_member(data, "guild_id")));
+
+	if (!da->native_meta || guild == NULL || id == 0) {
+		return;
+	}
+
+	if (DISCORD_CHANNEL_IS_THREAD(type)) {
+		DiscordChannel *thread = g_hash_table_lookup_int64(guild->threads, id);
+
+		if (thread == NULL) {
+			/* New to us, e.g. unarchived or newly visible */
+			guint64 parent_id = to_int(json_object_get_string_member(data, "parent_id"));
+			DiscordChannel *parent = g_hash_table_lookup_int64(guild->channels, parent_id);
+
+			if (parent != NULL) {
+				discord_add_thread(da, guild, parent, data, guild->id);
+			}
+		} else {
+			JsonObject *metadata = json_object_get_object_member(data, "thread_metadata");
+
+			if (json_object_has_member(data, "name")) {
+				g_free(thread->name);
+				thread->name = g_strdup(json_object_get_string_member(data, "name"));
+			}
+			if (metadata != NULL) {
+				thread->archived = json_object_get_boolean_member(metadata, "archived");
+				thread->locked = json_object_get_boolean_member(metadata, "locked");
+			}
+		}
+	} else {
+		DiscordChannel *channel = g_hash_table_lookup_int64(guild->channels, id);
+
+		if (channel == NULL) {
+			return;
+		}
+
+		if (json_object_has_member(data, "topic")) {
+			g_free(channel->topic);
+			channel->topic = g_strdup(json_object_get_string_member(data, "topic"));
+		}
+		if (json_object_has_member(data, "position")) {
+			channel->position = json_object_get_int_member(data, "position");
+		}
+		if (json_object_has_member(data, "parent_id")) {
+			channel->parent_id = to_int(json_object_get_string_member(data, "parent_id"));
+		}
+		if (json_object_has_member(data, "nsfw")) {
+			channel->nsfw = json_object_get_boolean_member(data, "nsfw");
+		}
+		if (json_object_has_member(data, "permission_overwrites")) {
+			/* Who can see it */
+			JsonArray *overrides = json_object_get_array_member(data, "permission_overwrites");
+
+			g_hash_table_remove_all(channel->permission_user_overrides);
+			g_hash_table_remove_all(channel->permission_role_overrides);
+			for (int k = json_array_get_length(overrides) - 1; k >= 0; k--) {
+				discord_add_permission_override(channel, json_array_get_object_element(overrides, k));
+			}
+		}
+	}
+
+	discord_tree_changed(da, guild->id);
+}
+
+/* CHANNEL_DELETE or THREAD_DELETE */
+static void
+discord_tree_channel_delete(DiscordAccount *da, JsonObject *data)
+{
+	guint64 id = to_int(json_object_get_string_member(data, "id"));
+	DiscordGuild *guild = discord_get_guild(da, to_int(json_object_get_string_member(data, "guild_id")));
+	DiscordChannel *thread;
+
+	if (!da->native_meta || guild == NULL || id == 0) {
+		return;
+	}
+
+	if ((thread = g_hash_table_lookup_int64(guild->threads, id)) != NULL) {
+		DiscordChannel *parent = g_hash_table_lookup_int64(guild->channels, thread->parent_id);
+
+		if (parent != NULL && parent->threads != NULL) {
+			g_hash_table_remove_int64(parent->threads, id);
+		}
+		g_hash_table_remove_int64(guild->threads, id);
+	} else if (g_hash_table_lookup_int64(guild->channels, id) != NULL) {
+		/* Its threads go with it */
+		GHashTableIter iter;
+		gpointer value;
+
+		g_hash_table_iter_init(&iter, guild->threads);
+		while (g_hash_table_iter_next(&iter, NULL, &value)) {
+			if (((DiscordChannel *) value)->parent_id == id) {
+				g_hash_table_remove(da->chan_state, &((DiscordChannel *) value)->id);
+				g_hash_table_iter_remove(&iter);
+			}
+		}
+		g_hash_table_remove_int64(guild->channels, id);
+	} else {
+		return;
+	}
+
+	g_hash_table_remove(da->chan_state, &id);
+	discord_tree_changed(da, guild->id);
+}
+
+/* GUILD_UPDATE: its name or icon */
+static void
+discord_tree_guild_update(DiscordAccount *da, JsonObject *data)
+{
+	DiscordGuild *guild = discord_get_guild(da, to_int(json_object_get_string_member(data, "id")));
+
+	if (!da->native_meta || guild == NULL) {
+		return;
+	}
+
+	if (json_object_has_member(data, "name")) {
+		g_free(guild->name);
+		guild->name = g_strdup(json_object_get_string_member(data, "name"));
+	}
+	if (json_object_has_member(data, "icon")) {
+		g_free(guild->icon);
+		guild->icon = g_strdup(json_object_get_string_member(data, "icon"));
+	}
+
+	discord_tree_changed(da, guild->id);
+	discord_tree_changed(da, 0);
+}
+
 static void
 discord_ipc_register(PurplePlugin *plugin)
 {
@@ -14439,8 +15794,46 @@ discord_ipc_register(PurplePlugin *plugin)
 			purple_value_new(PURPLE_TYPE_POINTER),
 			purple_value_new(PURPLE_TYPE_POINTER));
 
+	purple_plugin_ipc_register(plugin, "server-list",
+			PURPLE_CALLBACK(discord_ipc_server_list),
+			purple_marshal_BOOLEAN__POINTER_POINTER,
+			purple_value_new(PURPLE_TYPE_BOOLEAN), 2,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_POINTER));
+
+	purple_plugin_ipc_register(plugin, "server-tree",
+			PURPLE_CALLBACK(discord_ipc_server_tree),
+			purple_marshal_BOOLEAN__POINTER_POINTER_POINTER,
+			purple_value_new(PURPLE_TYPE_BOOLEAN), 3,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_POINTER));
+
+	purple_plugin_ipc_register(plugin, "channel-state",
+			PURPLE_CALLBACK(discord_ipc_channel_state),
+			purple_marshal_BOOLEAN__POINTER_POINTER_POINTER,
+			purple_value_new(PURPLE_TYPE_BOOLEAN), 3,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_POINTER));
+
+	purple_plugin_ipc_register(plugin, "open-channel",
+			PURPLE_CALLBACK(discord_ipc_open_channel),
+			purple_marshal_BOOLEAN__POINTER_POINTER,
+			purple_value_new(PURPLE_TYPE_BOOLEAN), 2,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING));
+
+	purple_plugin_ipc_register(plugin, "mark-channel-read",
+			PURPLE_CALLBACK(discord_ipc_mark_channel_read),
+			purple_marshal_BOOLEAN__POINTER_POINTER,
+			purple_value_new(PURPLE_TYPE_BOOLEAN), 2,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING));
+
 	purple_debug_info("discord", "Registered IPC commands send-correction, send-reaction, "
-	                  "send-retraction, send-reply, send-marker, mam-fetch-older and conversation-server\n");
+	                  "send-retraction, send-reply, send-marker, mam-fetch-older, conversation-server, "
+	                  "server-list, server-tree, channel-state, open-channel and mark-channel-read\n");
 
 	/* The end of a scroll-back page; only a message-meta UI listens */
 	{
@@ -14455,8 +15848,20 @@ discord_ipc_register(PurplePlugin *plugin)
 					purple_value_new(PURPLE_TYPE_STRING),
 					purple_value_new(PURPLE_TYPE_STRING),
 					purple_value_new(PURPLE_TYPE_BOOLEAN));
+			/* The server tree (see "Server tree") */
+			purple_signal_register(plugin, "server-tree-changed",
+					purple_marshal_VOID__POINTER_POINTER,
+					NULL, 2,
+					purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+					purple_value_new(PURPLE_TYPE_STRING));
+			purple_signal_register(plugin, "channel-state-changed",
+					purple_marshal_VOID__POINTER_POINTER_POINTER,
+					NULL, 3,
+					purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+					purple_value_new(PURPLE_TYPE_STRING),
+					purple_value_new(PURPLE_TYPE_STRING));
 			discord_plugin_handle = plugin;
-			purple_debug_info("discord", "Registered signal mam-query-done\n");
+			purple_debug_info("discord", "Registered signals mam-query-done, server-tree-changed and channel-state-changed\n");
 		}
 	}
 }
@@ -14487,6 +15892,8 @@ libpurple2_plugin_unload(PurplePlugin *plugin)
 	purple_plugin_ipc_unregister_all(plugin);
 	if (discord_plugin_handle != NULL) {
 		purple_signal_unregister(plugin, "mam-query-done");
+		purple_signal_unregister(plugin, "server-tree-changed");
+		purple_signal_unregister(plugin, "channel-state-changed");
 		discord_plugin_handle = NULL;
 	}
 
